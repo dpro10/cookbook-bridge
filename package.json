@@ -1,0 +1,68 @@
+{
+  "name": "cookbook-bridge",
+  "version": "0.1.14",
+  "description": "Run your own Claude, Codex and Gemini subscriptions against your Cookbook workspaces. One approval connects every agent CLI on your machine, with a receipt for every run.",
+  "type": "module",
+  "bin": {
+    "cookbook-bridge": "bridge.mjs"
+  },
+  "main": "bridge.mjs",
+  "files": [
+    "README.md",
+    "approve-mcp.mjs",
+    "bridge.mjs",
+    "chat.mjs",
+    "chef-persona.md",
+    "chef.mjs",
+    "codex-runner.mjs",
+    "config.example.json",
+    "connectors.mjs",
+    "cookbook.mjs",
+    "device.mjs",
+    "hands.mjs",
+    "harden.mjs",
+    "hook-reporter.mjs",
+    "live.mjs",
+    "local.mjs",
+    "openclaw-runner.mjs",
+    "plan.mjs",
+    "prompt.mjs",
+    "realtime.mjs",
+    "robot-runner.mjs",
+    "sessions.mjs",
+    "synthesis.mjs",
+    "thread-runner.mjs",
+    "update.mjs",
+    "usage.mjs",
+    "volunteer.mjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/local.test.mjs test/review.test.mjs test/home.test.mjs test/kimi.test.mjs test/hands.test.mjs test/probe.test.mjs"
+  },
+  "keywords": [
+    "cookbook",
+    "mcp",
+    "agents",
+    "claude",
+    "codex",
+    "gemini",
+    "ai",
+    "bridge"
+  ],
+  "homepage": "https://cookbook.team",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dpro10/cookbook.git",
+    "directory": "bridge"
+  },
+  "bugs": {
+    "url": "https://cookbook.team"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

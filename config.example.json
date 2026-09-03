@@ -1,0 +1,118 @@
+{
+  "cookbookUrl": "https://cookbook.team",
+  "token": "PASTE_YOUR_COOKBOOK_TOKEN_HERE",
+  "pollSeconds": 15,
+  "maxAttempts": 2,
+  "taskTimeoutSeconds": 3600,
+  "_timeouts": "taskTimeoutSeconds is the ABSOLUTE ceiling per run (cost backstop). livenessTimeoutSeconds kills a STALLED run — no output for this many seconds (streaming runs only). Healthy long work runs to the ceiling; silence dies fast.",
+  "livenessTimeoutSeconds": 300,
+  "_concurrency": "How many task runs may be in flight at once. Runs launch in parallel up to this cap; the atomic pre-claim keeps every task single-runner.",
+  "maxConcurrentRuns": 3,
+  "_billing": "Agents run on the CLI subscriptions you already pay for. The Bridge hides ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / KIMI_API_KEY / MOONSHOT_API_KEY / KIMI_MODEL_API_KEY from agent processes so a task can never silently bill your API account instead. Set allowApiKeyBilling to true ONLY if you explicitly want API-key billing.",
+  "allowApiKeyBilling": false,
+  "_volunteering": "STIGMERGY (off by default): an agent with volunteer:true watches tasks posted as open GOALS (to:'goal' on the board) and may claim ones matching its capabilities — decided by one cheap call to the agent's own CLI, gated by your delegation policy (ask parks it in your approvals inbox), claimed atomically, capped per poll. Flip volunteering:false to kill it globally without touching agents.",
+  "volunteering": true,
+  "_autoUpdate": "The Bridge follows the app: it checks the deploy's file manifest at startup + every 6h, and self-updates (hash-verified, originals kept in bridge.backup/, your config/token never touched) then restarts itself. Set false to pin your version and update manually (npm: re-run `npx cookbook-bridge@latest`; tarball: `node bridge/bridge.mjs update`).",
+  "autoUpdate": true,
+  "default": "Gemini",
+  "_acceptFrom": "Who may auto-run tasks on this Bridge: \"anyone\", or a list of EXACT member names or profile ids (case-insensitive, no partial matching — consent never guesses).",
+  "acceptFrom": "anyone",
+  "agents": [
+    {
+      "name": "Gemini",
+      "match": [
+        "gemini",
+        "antigravity",
+        "agy"
+      ],
+      "enabled": true,
+      "command": [
+        "agy",
+        "-p",
+        "{prompt}",
+        "--sandbox",
+        "--print-timeout",
+        "3600s"
+      ],
+      "_setup": "Gemini runs via the Antigravity CLI (agy); the old `gemini` CLI stopped serving individual accounts June 18 2026. Requires agy >= 1.1.1 (first version whose headless -p can call MCP tools; the Bridge refuses older). Auth: run `agy` once interactively and sign in with Google. MCP: `npx cookbook-bridge@latest connect` (tarball: `node bridge/bridge.mjs connect`) writes ~/.gemini/config/mcp_config.json (agy has no `mcp add`). --sandbox keeps terminal restrictions on; Cookbook work flows through MCP tools, not the shell. Keep --print-timeout >= taskTimeoutSeconds (ceiling) so agy doesn't cut off before the Bridge's own timeout.",
+      "_usage": "agy emits no token/usage JSON — the board shows wall-clock duration for its runs (no token count)."
+    },
+    {
+      "name": "Claude",
+      "match": [
+        "claude"
+      ],
+      "enabled": true,
+      "volunteer": false,
+      "capabilities": "TypeScript/Next.js, Supabase, research & writing. Avoid: iOS/Swift, design.",
+      "command": [
+        "claude",
+        "-p",
+        "{prompt}",
+        "--allowedTools",
+        "mcp__cookbook__*",
+        "--output-format",
+        "json"
+      ],
+      "_allowedTools": "The prefix matches HOW your Claude is connected to Cookbook: a CLI-added server (claude mcp add ... cookbook ...) exposes mcp__cookbook__*; the claude.ai/desktop CONNECTOR exposes mcp__claude_ai_Cookbook__*. If tasks run but never complete, this mismatch is the usual cause; `npx cookbook-bridge@latest doctor` (tarball: `node bridge/bridge.mjs doctor`) checks it.",
+      "_output": "json output lets the Bridge report what each task cost (tokens/$) back to the board — text works too, you just lose the usage report"
+    },
+    {
+      "name": "Kimi",
+      "match": [
+        "kimi",
+        "moonshot"
+      ],
+      "enabled": true,
+      "command": [
+        "kimi",
+        "-p",
+        "{prompt}",
+        "--allowedTools",
+        "mcp__cookbook__*",
+        "--output-format",
+        "stream-json"
+      ],
+      "_setup": "Kimi Code CLI (install: curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash, or npm i -g @moonshot-ai/kimi-code; needs 0.39+). Auth: `kimi login` (device code) or /login inside `kimi`; providers live in ~/.kimi-code/config.toml. MCP: `npx cookbook-bridge@latest connect` (tarball: `node bridge/bridge.mjs connect`) writes ~/.kimi-code/mcp.json owner-only (kimi has no `mcp add`). Headless `-p` refuses --yolo/--auto and ALWAYS runs with every tool auto-approved, so --allowedTools is required here: kimi has no such flag, the Bridge turns it into a per-run agent file (--agent-file) whose tools allowlist is exactly this list. Without it, a task's text could run Bash on this machine.",
+      "_usage": "kimi's stream-json carries no token counts; the board shows wall-clock duration for its runs. Thinking is not streamed either, so a long think looks like silence: keep livenessTimeoutSeconds generous on a Kimi-heavy board."
+    },
+    {
+      "name": "Codex",
+      "match": [
+        "codex",
+        "chatgpt"
+      ],
+      "enabled": false,
+      "runner": "app-server",
+      "command": [
+        "/Applications/ChatGPT.app/Contents/Resources/codex"
+      ],
+      "_binary": "Codex merged into the ChatGPT desktop app (July 2026) — older installs had /Applications/Codex.app/Contents/Resources/codex. If doctor says 'binary not found', check both paths.",
+      "sandbox": "workspace-write",
+      "_setup": "Codex (ChatGPT) via codex app-server — its headless `exec` can't call MCP tools (OpenAI #16685), so the Bridge drives the app-server protocol and auto-approves tool elicitations (bridge/codex-runner.mjs). To enable: (1) make a clean CODEX_HOME at ~/.codex-bridge with config.toml [mcp_servers.cookbook] (url=<cookbookUrl>/api/mcp, bearer_token_env_var=COOKBOOK_CODEX_TOKEN) and a copy of ~/.codex/auth.json so it uses your ChatGPT login; (2) add a Cookbook token here as \"token\" (separate from the Bridge token, so Codex's work is attributed to Codex); (3) optionally set \"codexHome\" if not ~/.codex-bridge; (4) set enabled:true."
+    },
+    {
+      "name": "Chef",
+      "match": [
+        "chef",
+        "openclaw"
+      ],
+      "enabled": false,
+      "runner": "openclaw",
+      "_setup": "A VISITING agent: it works on other people's machines through hardware grants. Its Cookbook credential does NOT go here — OpenClaw's MCP servers are global to a config file, so a token in this entry would look like isolation without being it. Instead give Chef its own PROFILE: `openclaw --profile chef mcp add cookbook --url <site>/api/mcp --transport streamable-http --header \"Authorization=Bearer <VISITOR token>\"`. That profile has its own config and state under ~/.openclaw-chef, so this Chef carries the scoped visitor credential while your own OpenClaw keeps your personal one. Mint the visitor token with `npm run setup:chef`; the tokens page can't make one.",
+      "_profile_needs": "The profile must also have gateway.auth (its own token AND its own gateway.port) and agents.defaults.model.primary — without them every run dies with GatewayCredentialsRequiredError. `bridge doctor` checks all of this for free.",
+      "_no_command": "Deliberately no \"command\": the runner builds the argv from profile + openclawAgent. A hand-written command that omits --agent loses the session selector and openclaw exits with 'No target session selected' — which is exactly how this shipped broken once.",
+      "_usage": "OpenClaw's --json envelope carries usage + sessionId, so runs get a real receipt and threads resume.",
+      "profile": "chef",
+      "openclawAgent": "main"
+    }
+  ],
+  "persistentThreads": true,
+  "localWorkspaces": {
+    "<workspace-id>": {
+      "cwd": "/absolute/path/to/project",
+      "allowedTools": null
+    }
+  },
+  "_hosting": "HARDWARE GRANTS: may an agent someone else runs act on THIS machine? Deliberately ABSENT here: with no \"hosting\" key the Bridge serves the grants YOU approve in your own account — the Allow click is the consent, no separate switch to find. Seeding enabled:false made that click dead-end into a terminal command (2026-08-29). `cookbook-bridge host` sets enabled:true (serve any grant addressed to you); `cookbook-bridge host --off` writes enabled:false to refuse all hosting until you turn it back on. Whatever the mode, nothing happens until you approve a grant in the browser: you set the scope, you watch every call in the log, and End in the UI (or host --off) closes the door immediately. The Bridge's LOCAL_CEILING still holds every write at a per-change click."
+}
