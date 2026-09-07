@@ -27,6 +27,7 @@
  * Jobs are queued FIFO and drained one at a time. A pull that lands while a run
  * is in progress only enqueues; nothing is dropped. Zero dependencies.
  */
+import { isSignedOutError } from "./plan.mjs";
 import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -185,6 +186,7 @@ function runClaude(bin, prompt, { args, env, cwd, timeoutMs } = {}) {
       const text = trimResult(out);
       if (timedOut) resolve({ ok: false, timedOut: true, error: `timed out after ${Math.round((timeoutMs ?? SYNTHESIS_TIMEOUT_MS) / 1000)}s` });
       else if (code === 0 && text) resolve({ ok: true, text });
+      else if (isSignedOutError(err)) resolve({ ok: false, error: "Claude is signed out on this machine: open a terminal, run `claude`, and sign in" });
       else resolve({ ok: false, error: `exit ${code}: ${err.trim().slice(0, 300) || "(no stderr)"}` });
     });
     child.stdin.write(String(prompt));
@@ -197,9 +199,27 @@ function runClaude(bin, prompt, { args, env, cwd, timeoutMs } = {}) {
  *  --model. A timeout is not a rejected alias, so it is not retried. */
 async function runWithFallback(bin, prompt, { kind, model, variant, env, cwd }) {
   const timeoutMs = timeoutForKind(kind);
-  let r = await runClaude(bin, prompt, { args: argsForKind(kind, { model, variant }), env, cwd, timeoutMs });
-  if (!r.ok && !r.timedOut && model) r = await runClaude(bin, prompt, { args: argsForKind(kind, { variant }), env, cwd, timeoutMs });
-  return r;
+  // A probe measures what a STRANGER's Claude would say, so it must run in a
+  // fresh empty directory: Claude Code loads its per-directory auto-memory and
+  // any CLAUDE.md from the cwd, and the Bridge's own cwd is full of Cookbook.
+  // (The 2026-09-03 baseline run leaked "your existing Cookbook setup" this way.)
+  let scratch = null;
+  if (kind === "probe" && !cwd) {
+    scratch = await fsp.mkdtemp(path.join(os.tmpdir(), "cookbook-probe-"));
+    cwd = scratch;
+  }
+  try {
+    let r = await runClaude(bin, prompt, { args: argsForKind(kind, { model, variant }), env, cwd, timeoutMs });
+    if (!r.ok && !r.timedOut && model) r = await runClaude(bin, prompt, { args: argsForKind(kind, { variant }), env, cwd, timeoutMs });
+    return r;
+  } finally {
+    if (scratch) await fsp.rm(scratch, { recursive: true, force: true }).catch(() => { /* best effort */ });
+  }
+}
+
+/** Where a probe runs: a fresh temp dir, never the Bridge's own cwd. Pure. */
+export function probeNeedsScratchCwd(kind, cwd) {
+  return kind === "probe" && !cwd;
 }
 
 /** Download the job's image into `dir` as image.<ext>. Refuses non-https, unknown

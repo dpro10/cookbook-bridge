@@ -123,3 +123,44 @@ export function planLine(vendor, entry) {
   if (s) parts.push(`${s} of week`);
   return `${vendor}${entry?.plan ? ` (${entry.plan})` : ""}: ${parts.join(" · ") || "no windows"}`;
 }
+
+// ── SIGNED OUT (0100, 2026-09-07) ─────────────────────────────────────────────
+// A Bridge used to advertise an agent because its CLI was installed; whether the
+// CLI could actually run was learned one failed task at a time ("OAuth session
+// expired and could not be refreshed", every run, Pierre's Mac). The Bridge now
+// asks the CLI (`claude auth status`) at boot, every ten minutes, and right after
+// an auth failure, and rides the answer on the same heartbeat as `agents=`.
+const auth = new Map(); // vendor -> { ok: boolean, at }
+const SIGNED_OUT_NAME = { claude: "Claude", codex: "Codex", gemini: "Gemini", openclaw: "OpenClaw" };
+
+/** Record a vendor's sign-in state. Returns true when it CHANGED (log once, not per beat). */
+export function noteAuth(vendor, ok, now = Date.now()) {
+  if (!VENDORS.has(vendor)) return false;
+  const prev = auth.get(vendor);
+  auth.set(vendor, { ok: !!ok, at: now });
+  return !prev || prev.ok !== !!ok;
+}
+
+/** Vendors currently known to be signed out. */
+export function signedOutVendors() {
+  return [...auth].filter(([, v]) => !v.ok).map(([k]) => k);
+}
+
+/** `signed_out=Claude` once auth has been checked ("signed_out=" when everything is
+ *  signed in, so the server clears the flag the moment the member signs back in);
+ *  "" before any check, so an unchecked Bridge leaves the column alone. */
+export function signedOutParam() {
+  if (!auth.size) return "";
+  return `signed_out=${encodeURIComponent(signedOutVendors().map((v) => SIGNED_OUT_NAME[v] ?? v).join(","))}`;
+}
+
+/** For tests. */
+export function resetAuth() {
+  auth.clear();
+}
+
+/** Does this CLI failure text mean "signed out"? Judged on stderr, never on the model's answer. */
+export function isSignedOutError(text) {
+  const t = String(text ?? "").toLowerCase();
+  return /oauth session expired|could not be refreshed|failed to authenticate|not logged in|please log in|login required|not authenticated/.test(t);
+}

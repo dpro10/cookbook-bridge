@@ -8,7 +8,7 @@
  *
  * Node built-ins only (global fetch, Node 18+). No dependencies.
  */
-import { planParam } from "./plan.mjs";
+import { planParam, signedOutParam } from "./plan.mjs";
 
 /** Call one Cookbook MCP tool. Returns the tool's body (structuredContent). */
 export async function callTool(cfg, name, args = {}) {
@@ -260,6 +260,9 @@ export function agentsQuery(cfg, plan = planParam) {
   // reported them to this Bridge (bridge/plan.mjs). Rides the same heartbeat.
   const p = typeof plan === "function" ? plan() : "";
   if (p) parts.push(p);
+  // `signed_out=…` — which of those agents' CLIs cannot run right now (0100).
+  const so = signedOutParam();
+  if (so) parts.push(so);
   return parts.length ? `?${parts.join("&")}` : "";
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "cookbook-bridge",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Run your own Claude, Codex and Gemini subscriptions against your Cookbook workspaces. One approval connects every agent CLI on your machine, with a receipt for every run.",
   "type": "module",
   "bin": {
@@ -55,11 +55,10 @@
   "homepage": "https://cookbook.team",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dpro10/cookbook.git",
-    "directory": "bridge"
+    "url": "git+https://github.com/dpro10/cookbook-bridge.git"
   },
   "bugs": {
-    "url": "https://cookbook.team"
+    "url": "https://github.com/dpro10/cookbook-bridge/issues"
   },
   "license": "MIT",
   "publishConfig": {

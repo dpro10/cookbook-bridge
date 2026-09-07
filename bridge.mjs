@@ -34,7 +34,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { callsFromStreamLine, foldCallEvent, wireCalls, shortTool, argFor } from "./live.mjs";
-import { planFromStreamLine, notePlan, planLine } from "./plan.mjs";
+import { planFromStreamLine, notePlan, planLine, noteAuth, isSignedOutError } from "./plan.mjs";
 
 // Node version guard: below 18 there is no global fetch and none of this runs. One
 // plain line beats a stack trace from the first `fetch(` call.
@@ -739,8 +739,8 @@ function failureHint(result) {
   const infra = String(err || "").toLowerCase();
   const tailSrc = `${err || display || (brace < 0 ? rawOut : "")}`.trim();
   const tail = tailSrc.split("\n").slice(-2).join(" ").slice(0, 240);
-  if (infra.includes("not logged in") || infra.includes("please log in"))
-    return "the agent CLI isn't logged in → run `claude auth login`";
+  if (isSignedOutError(infra))
+    return "Claude on this machine is signed out → open a terminal, run `claude`, and sign in; this Bridge picks it up on its own";
   // Kimi's own error strings (stderr: "error: failed to run prompt: provider.connection_error: …").
   if (infra.includes("provider.connection_error") || infra.includes("connection error"))
     return "the agent CLI can't reach its API (a network or DNS block on the vendor's hosts) → check the connection, then try `kimi -p hi` by hand";
@@ -1439,6 +1439,10 @@ async function processTask(cfg, ws, task, agent) {
       // turns a multi-hour debug into a one-glance fix.
       const hint = failureHint(result);
       const why = hint ? ` — ${hint}` : "";
+      if (/signed out/.test(hint) && isClaudeCommand && isClaudeCommand(agent.command)) {
+        if (noteAuth("claude", false)) log("! Claude is signed out on this machine → run `claude` in a terminal and sign in. Until then Claude work here falls back or waits.");
+        lastAuthCheck = Date.now() - AUTH_CHECK_MS + 60_000; // re-check in a minute
+      }
       if (holdDuringRun()) {
         shelveForHold(hint || "plan limit reached", result?.sessionId ?? null);
       } else if (n >= cfg.maxAttempts) {
@@ -2082,6 +2086,45 @@ async function pollOnce(cfg, onlyWorkspaceIds = null) {
 
 /** How often a RUNNING bridge re-checks the deploy manifest ("app updated → I update"). */
 const UPDATE_CHECK_MS = 6 * 60 * 60 * 1000;
+/** How often to ask the CLI whether it is still signed in (0100). */
+const AUTH_CHECK_MS = 10 * 60 * 1000;
+let lastAuthCheck = 0;
+
+/**
+ * Ask claude whether it is signed in (`claude auth status` prints JSON with
+ * `loggedIn`). Only claude has this today; other vendors are learned from their
+ * failures. Records the state (plan.mjs noteAuth) so the heartbeat advertises it,
+ * and logs once per change. Never throws; an unreadable answer changes nothing.
+ */
+async function checkClaudeAuth(cfg) {
+  const agent = (cfg?.agents ?? []).find((a) => a && a.enabled !== false && isClaudeCommand && isClaudeCommand(a.command));
+  if (!agent) return null;
+  const cmd = agent.command[0];
+  const env = typeof agentEnv === "function" ? agentEnv(cfg).env : process.env;
+  const out = await new Promise((resolve) => {
+    let text = "";
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const child = spawn(cmd, ["auth", "status"], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+      child.stdout.on("data", (d) => { text += d; });
+      child.stderr.on("data", (d) => { text += d; });
+      child.on("error", () => finish(null));
+      child.on("close", () => finish(text));
+      setTimeout(() => { try { child.kill(); } catch { /* gone */ } finish(null); }, 15_000).unref();
+    } catch { finish(null); }
+  });
+  if (out === null) return null;
+  let loggedIn = null;
+  const brace = out.indexOf("{");
+  if (brace >= 0) { try { const j = JSON.parse(out.slice(brace)); if (typeof j.loggedIn === "boolean") loggedIn = j.loggedIn; } catch { /* not JSON */ } }
+  if (loggedIn === null && isSignedOutError(out)) loggedIn = false;
+  if (loggedIn === null) return null;
+  const changed = noteAuth("claude", loggedIn);
+  if (changed && !loggedIn) log("! Claude is signed out on this machine → open a terminal, run `claude`, and sign in. This Bridge re-checks every 10 minutes.");
+  if (changed && loggedIn && lastAuthCheck > 0) log("✓ Claude is signed in again — Claude work resumes here.");
+  return loggedIn;
+}
 
 /**
  * WHO OWNS THIS INSTALL'S VERSION.
@@ -2157,6 +2200,9 @@ async function main() {
   const cfg = loadConfig();
   log(`Cookbook Bridge started · ${cfg.cookbookUrl}`);
   log(`Managing: ${cfg.agents.map((a) => a.name).join(", ") || "(no agents enabled!)"} · polling every ${cfg.pollSeconds}s`);
+  // Is the CLI actually able to run? (0100) The answer rides the first heartbeat.
+  await checkClaudeAuth(cfg).catch(() => null);
+  lastAuthCheck = Date.now();
 
   // "When the app updates, so does the Bridge": check the deploy manifest now, then
   // every 6h while running. Set "autoUpdate": false in config to pin.
@@ -2406,6 +2452,10 @@ async function main() {
           }
         }
       }
+    }
+    if (Date.now() - lastAuthCheck > AUTH_CHECK_MS) {
+      lastAuthCheck = Date.now();
+      void checkClaudeAuth(cfg).catch(() => null);
     }
     if (Date.now() - lastUpdateCheck > UPDATE_CHECK_MS) {
       lastUpdateCheck = Date.now();
@@ -2685,6 +2735,9 @@ async function doctorReport(args) {
       }
 
       if (isClaudeCommand && isClaudeCommand(agent.command)) {
+        const signedIn = await checkClaudeAuth({ ...cfg, agents: [agent] }).catch(() => null);
+        if (signedIn === false) bad(`${agent.name}: claude is SIGNED OUT on this machine`, "open a terminal, run `claude`, and sign in (or `claude auth login`)");
+        else if (signedIn === true) ok(`${agent.name}: claude is signed in`);
         if (agent.token) ok(`${agent.name}: runs carry their own Cookbook connection (per-agent token) — identity is this Bridge's member`);
         else warn(`${agent.name}: no per-agent token — runs use the claude CLI's OWN Cookbook login, which may be a different account and inherits stale claude.ai connectors`,
           `run \`${cli("connect")}\` (mints a token for this agent) or add "token" to this agent in ${cfgPath}`);

@@ -2,7 +2,8 @@
 //   node --test bridge/test/probe.test.mjs
 import test from "node:test";
 import assert from "node:assert/strict";
-import { argsForKind, kindOf, validateJob, describeJob, timeoutForKind, variantOf, runSynthesisJobs, resetSynthesisQueue,
+import {
+  probeNeedsScratchCwd, argsForKind, kindOf, validateJob, describeJob, timeoutForKind, variantOf, runSynthesisJobs, resetSynthesisQueue,
   KINDS, PROBE_TIMEOUT_MS, PROBE_VARIANTS } from "../synthesis.mjs";
 
 test("probe argv: the model variant has no tools, the search variant has WebSearch only (and it is allowed)", () => {
@@ -84,4 +85,10 @@ test("a probe without a variant is refused before anything runs", async () => {
   );
   assert.equal(ran, 0);
   assert.match(reports[0].payload.error, /no variant/);
+});
+
+test("a probe runs in a scratch cwd unless one was given; other kinds keep the Bridge cwd", () => {
+  assert.equal(probeNeedsScratchCwd("probe", undefined), true);
+  assert.equal(probeNeedsScratchCwd("probe", "/tmp/given"), false);
+  assert.equal(probeNeedsScratchCwd("summary", undefined), false);
 });
