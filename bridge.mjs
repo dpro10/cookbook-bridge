@@ -2159,6 +2159,39 @@ let updateNagged = false;
  * Check failures are non-fatal (offline is fine); a FAILED apply never breaks the
  * running code (verification happens before any write; originals in bridge.backup/).
  */
+/**
+ * Install the runtime + login service and wait for it to come up. Returns true
+ * when a Bridge is running under the service; false (with the reason printed) so
+ * the caller can fall back to a foreground run.
+ */
+async function installAsService(svc, { cookbookUrl, cfgPath }) {
+  const say = (m) => console.log(`  ${m}`);
+  try {
+    console.log("\nInstalling the Bridge as a background service…");
+    await svc.installRuntime({ cookbookUrl, log: say });
+    svc.installService({ config: cfgPath, log: say });
+    process.stdout.write("  Starting");
+    const pid = await svc.waitForBridge(cfgPath, { timeoutMs: 30_000 });
+    console.log("");
+    const st = svc.serviceState({ config: cfgPath });
+    if (pid) {
+      console.log(`\n  ✓ The Bridge is running in the background (pid ${pid}). It starts with your computer,`);
+      console.log("    updates itself from cookbook.team, and this window can close.");
+    } else {
+      console.log(`\n  ! The service is installed but the Bridge has not reported in yet. Its log: ${st.log}`);
+    }
+    console.log(`\n  Config:   ${cfgPath}`);
+    console.log(`  Log:      ${st.log}`);
+    console.log(`  Check:    ${cli("doctor")}`);
+    console.log(`  Restart:  ${cli("restart")}`);
+    console.log(`  Remove:   ${cli("uninstall")}\n`);
+    return true;
+  } catch (e) {
+    console.log(`\n  ! Could not install the service: ${e.message}`);
+    return false;
+  }
+}
+
 async function selfUpdate(cfg, { reexec }) {
   let check;
   try {
@@ -2183,6 +2216,10 @@ async function selfUpdate(cfg, { reexec }) {
   try {
     const replaced = await applyUpdate(cfg, HERE, check);
     log(`⬆ Bridge self-updated to deploy ${check.version} (${replaced.length} file(s), hash-verified; previous in bridge.backup/${check.version}/).`);
+    if (reexec && process.env.COOKBOOK_SERVICE === "1") {
+      log("↻ restarting on the new code (the service brings it back)…");
+      process.exit(0);
+    }
     if (reexec) {
       log("↻ restarting on the new code…");
       const { spawn } = await import("node:child_process");
@@ -2379,6 +2416,13 @@ async function main() {
       log(`  Fix it in the app (Connect your agents), or run \`${cli("connect")}\`. The control API stays up so you can.`);
     } else {
       console.error(`\nCouldn't connect to Cookbook: ${e.message}`);
+      // Under a login service the supervisor restarts us at once; a dead token
+      // would then hit the server every 15 seconds forever. Say the fix, then
+      // wait before exiting so the loop is gentle (service.mjs, 2026-09-09).
+      if (process.env.COOKBOOK_SERVICE === "1") {
+        console.error(`  Fix: ${cli("connect")}   (reconnects; the service picks the new token up on its own). Retrying in 5 minutes.`);
+        await new Promise((r) => setTimeout(r, 5 * 60 * 1000));
+      }
       process.exit(1);
     }
   }
@@ -2448,6 +2492,10 @@ async function main() {
           } else {
             log("✗ Cookbook has rejected this token 5 polls in a row — it was likely revoked (a new login replaces old tokens) or expired.");
             log(`  Fix: ${cli("connect")}   (reconnects and starts the Bridge)`);
+            if (process.env.COOKBOOK_SERVICE === "1") {
+              log("  Running as a service: retrying in 5 minutes.");
+              await new Promise((r) => setTimeout(r, 5 * 60 * 1000));
+            }
             process.exit(1);
           }
         }
@@ -2577,6 +2625,18 @@ async function doctorReport(args) {
       bad(`Config isn't valid JSON: ${e.message}`);
       cfg = null;
     }
+  }
+
+  // 2a½. The login service (2026-09-09): installed? running?
+  try {
+    const svc = await import("./service.mjs");
+    const st = svc.serviceState({ config: cfgPath });
+    if (!st.kind) ok("Login service: not available on this platform (run the Bridge in a terminal)");
+    else if (st.installed && st.pid) ok(`Login service: installed (${st.definition}) and running (pid ${st.pid})`);
+    else if (st.installed) warn(`Login service: installed (${st.definition}) but no Bridge is reporting in`, `look at ${st.log}, or \`${cli("restart")}\``);
+    else if (!IS_DESKTOP) warn("Login service: not installed, so the Bridge stops when this window closes", `\`${cli("install")}\` installs it and starts it now`);
+  } catch (e) {
+    ok(`Login service: could not check (${e.message})`);
   }
 
   // 2b. Another Bridge on this machine? Two on one config fight over the same token
@@ -2906,13 +2966,24 @@ if (!IS_MAIN) {
     .then(async (m) => {
       const args = process.argv.slice(3);
       const noRun = args.includes("--no-run");
-      const r = await m.connectAgents(args.filter((a) => a !== "--no-run"), { willRun: !noRun });
+      // THE SERVICE (2026-09-09): after the approval the Bridge is installed as a
+      // login service and started, so the window can close and it survives reboots.
+      // `--no-service` keeps the foreground run; the desktop app supervises its own.
+      const svc = await import("./service.mjs");
+      const wantService = !noRun && !args.includes("--no-service") && !IS_DESKTOP && !!svc.serviceKind();
+      const passArgs = args.filter((a) => a !== "--no-run" && a !== "--no-service" && a !== "--no-signin").concat(args.includes("--no-signin") ? ["--no-signin"] : []);
+      const r = await m.connectAgents(passArgs, { willRun: !noRun, service: wantService });
       if (!r || !r.ok) {
         // Nothing to run (no agent CLI found): the doctor says what is missing and how to fix it.
         if (r && r.reason === "no-agents") await runDoctor(["--config", r.cfgPath]);
         return;
       }
       if (noRun || !r.startBridge) return;
+      if (wantService) {
+        const done = await installAsService(svc, { cookbookUrl: r.baseUrl, cfgPath: r.cfgPath });
+        if (done) return;
+        console.log("Falling back to running the Bridge here.\n");
+      }
       console.log("Connected. Running the Bridge now; leave this window open. Ctrl-C stops it.\n");
       process.argv = [process.argv[0], process.argv[1], r.cfgPath];
       await main();
@@ -2949,6 +3020,33 @@ if (!IS_MAIN) {
       console.error(e.message);
       process.exit(1);
     });
+} else if (sub === "install") {
+  // Runtime + login service + start, against an existing config (connect does this
+  // for you; `install` is for a machine that already has a config).
+  (async () => {
+    const svc = await import("./service.mjs");
+    const cfgPath = configPathFromArgs(process.argv.slice(3));
+    let cookbookUrl = "";
+    try { cookbookUrl = String(JSON.parse(fs.readFileSync(cfgPath, "utf8")).cookbookUrl || "").replace(/\/$/, ""); } catch { /* below */ }
+    if (!cookbookUrl) { console.error(`No config at ${cfgPath}. Run \`${cli("connect")}\` first.`); process.exit(1); }
+    const ok = await installAsService(svc, { cookbookUrl, cfgPath });
+    process.exit(ok ? 0 : 1);
+  })().catch((e) => { console.error(e.message); process.exit(1); });
+} else if (sub === "uninstall") {
+  (async () => {
+    const svc = await import("./service.mjs");
+    const cfgPath = configPathFromArgs(process.argv.slice(3));
+    const r = svc.uninstallService({ config: cfgPath, log: (m) => console.log(`  ${m}`) });
+    console.log(r.removed.length ? `Service removed (${r.removed.join(", ")}).` : "No service was installed.");
+    console.log(`Your config and token are untouched at ${cfgPath}. To revoke the Bridge's access, remove it under Account > Connected apps.`);
+  })().catch((e) => { console.error(e.message); process.exit(1); });
+} else if (sub === "restart") {
+  (async () => {
+    const svc = await import("./service.mjs");
+    const cfgPath = configPathFromArgs(process.argv.slice(3));
+    const ok = svc.restartService({ config: cfgPath });
+    console.log(ok ? "Restarting the Bridge service." : `No running service found for ${cfgPath}. Start one with \`${cli("install")}\`.`);
+  })().catch((e) => { console.error(e.message); process.exit(1); });
 } else if (sub === "status") {
   import("./device.mjs")
     .then((m) => m.status(process.argv.slice(3)))

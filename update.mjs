@@ -117,6 +117,9 @@ export function locateConfig(args = [], opts = {}) {
 export function installLayout(here = HERE) {
   const n = String(here).replace(/\\/g, "/") + "/";
   if (n.includes("/_npx/") || n.includes("/node_modules/cookbook-bridge/")) return "npm";
+  // The service runtime (~/.cookbook/bridge, service.mjs) is reached through npx too:
+  // its hints must read `npx cookbook-bridge@latest …`, never `node bridge/bridge.mjs`.
+  if (n.endsWith("/.cookbook/bridge/")) return "npm";
   return "tarball";
 }
 

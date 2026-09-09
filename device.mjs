@@ -582,7 +582,7 @@ function probeAgent(cmd) {
  * Codex (ChatGPT app), Kimi and OpenClaw; mints one named token per agent in the same
  * approval as the Bridge token; configures each via its official path.
  */
-export async function connectAgents(argv, { willRun = false } = {}) {
+export async function connectAgents(argv, { willRun = false, service = false } = {}) {
   const cfgPath = configPath(argv);
   const found = detectClis();
   if (found.length === 0) {
@@ -591,6 +591,13 @@ export async function connectAgents(argv, { willRun = false } = {}) {
     return { ok: false, reason: "no-agents", cfgPath };
   }
   console.log(`\nFound agent CLIs: ${found.map((c) => c.agent).join(", ")}`);
+
+  // ONE-CLICK SIGN-IN (2026-09-09). The Bridge can only run a CLI that is signed
+  // in, and "signed out" was the failure behind every dead task Texas Accelerate
+  // and Pierre hit. So before the Cookbook approval, sign the CLIs in right here:
+  // claude opens Anthropic's own login page; codex shows OpenAI's device code.
+  // Each token lands in that CLI's own store on this disk; Cookbook never sees it.
+  if (!argv.includes("--no-signin")) await ensureSignedIn(found);
 
   // One approval mints the bridge token + one named token per agent.
   const res = await login(argv, { agents: found.map((c) => c.agent), quietOutro: true });
@@ -605,8 +612,77 @@ export async function connectAgents(argv, { willRun = false } = {}) {
     console.log(`  ${mark} ${r.agent}: ${r.detail}${r.ok && !r.warn ? ` (work will be attributed "${r.agent} · via you")` : ""}`);
   }
   await reportStaleness(res.baseUrl);
-  reportNextStep(res.cfgPath, { willRun });
-  return { ok: true, startBridge: true, cfgPath: res.cfgPath, agentTokens: true };
+  if (!service) reportNextStep(res.cfgPath, { willRun });
+  return { ok: true, startBridge: true, cfgPath: res.cfgPath, agentTokens: true, baseUrl: res.baseUrl, found };
+}
+
+/** `claude auth status` → true / false / null (unknown). Never throws. */
+export function claudeSignedIn(claudePath) {
+  try {
+    const argv = argvForSpawn([claudePath, "auth", "status"]);
+    const r = spawnSync(argv[0], argv.slice(1), { encoding: "utf8", timeout: 15_000, windowsHide: true });
+    const out = `${r.stdout || ""}${r.stderr || ""}`;
+    const brace = out.indexOf("{");
+    if (brace >= 0) { try { const j = JSON.parse(out.slice(brace)); if (typeof j.loggedIn === "boolean") return j.loggedIn; } catch { /* not JSON */ } }
+    if (/not logged in|please log in|expired|not authenticated/i.test(out)) return false;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Does codex have a login on this machine? (`~/.codex/auth.json` is what `codex login` writes.) */
+export function codexSignedIn(home = os.homedir()) {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(home, ".codex", "auth.json"), "utf8"));
+    return !!(j && (j.tokens || j.OPENAI_API_KEY || j.access_token));
+  } catch {
+    return false;
+  }
+}
+
+/** Run a CLI's own interactive sign-in in this terminal and wait for it. */
+function runInteractive(bin, args) {
+  return new Promise((resolve) => {
+    try {
+      const argv = argvForSpawn([bin, ...args]);
+      const child = spawn(argv[0], argv.slice(1), { stdio: "inherit" });
+      child.on("error", () => resolve(false));
+      child.on("close", (code) => resolve(code === 0));
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+/**
+ * Sign in every detected CLI that is signed out, in the terminal, before anything
+ * else. Claude: Anthropic's browser login (`claude auth login`). Codex: OpenAI's
+ * device code (`codex login --device-auth`). Skipped for CLIs we cannot check.
+ */
+export async function ensureSignedIn(found, { log = console.log } = {}) {
+  const outcome = [];
+  for (const c of found) {
+    if (c.vendor === "claude") {
+      const state = claudeSignedIn(c.path);
+      if (state === false) {
+        log("\n  Claude Code is signed out on this machine. Sign in with the account you use in the browser:\n");
+        const ok = await runInteractive(c.path, ["auth", "login"]);
+        const after = claudeSignedIn(c.path);
+        log(after ? "\n  ✓ Claude Code is signed in.\n" : "\n  ! Claude Code still looks signed out. Run `claude` in a terminal and sign in, then re-run connect.\n");
+        outcome.push({ agent: "Claude", signedIn: !!after, ran: ok });
+      } else outcome.push({ agent: "Claude", signedIn: state !== false, ran: false });
+    } else if (c.vendor === "codex" && c.kind === "codex" && !/ChatGPT\.app/i.test(String(c.path))) {
+      if (!codexSignedIn()) {
+        log("\n  Codex has no ChatGPT login on this machine. Enter the code OpenAI shows you:\n");
+        const ok = await runInteractive(c.path, ["login", "--device-auth"]);
+        const after = codexSignedIn();
+        log(after ? "\n  ✓ Codex is signed in with your ChatGPT account.\n" : "\n  ! Codex still has no login. Run `codex login` in a terminal, then re-run connect.\n");
+        outcome.push({ agent: "Codex", signedIn: after, ran: ok });
+      } else outcome.push({ agent: "Codex", signedIn: true, ran: false });
+    }
+  }
+  return outcome;
 }
 
 /** The same manifest comparison the running Bridge does at startup, printed with the
