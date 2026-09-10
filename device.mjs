@@ -108,7 +108,10 @@ async function postForm(url, body) {
  */
 export async function beginDeviceFlow({ baseUrl, agents = null }) {
   const start = await postForm(`${baseUrl}/api/bridge/device`, {
-    device_label: os.hostname(),
+    // The device this credential is for (0101): a re-login from the same device
+    // replaces its own prior token; other devices keep theirs. The desktop app is
+    // its own "device" so it can live next to a terminal Bridge on one machine.
+    device_label: `${os.hostname()}${process.env.COOKBOOK_DESKTOP === "1" ? " (Cookbook Desktop)" : ""}`,
     ...(agents && agents.length ? { requested_agents: agents } : {}),
   });
   if (start.status !== 200 || !start.json.device_code) {

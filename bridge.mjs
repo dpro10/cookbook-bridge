@@ -2144,7 +2144,11 @@ async function checkClaudeAuth(cfg) {
  *            behavior: verify, back up, replace, re-exec.
  */
 function updateChannel() {
-  if (IS_DESKTOP) return "app";
+  // The desktop app runs the SEEDED copy in its data dir (COOKBOOK_RUNTIME_WRITABLE=1,
+  // 2026-09-09): outside the signed bundle, so self-update is safe there and the
+  // supervisor restarts us on the new code (COOKBOOK_SERVICE=1). Only the bundled
+  // fallback copy stays on the "app" channel.
+  if (IS_DESKTOP) return process.env.COOKBOOK_RUNTIME_WRITABLE === "1" ? "self" : "app";
   if (HERE.includes(`${path.sep}node_modules${path.sep}`)) return "npm";
   if (fs.existsSync(path.join(HERE, "package.json"))) return "npm";
   return "self";
@@ -2634,7 +2638,8 @@ async function doctorReport(args) {
     if (!st.kind) ok("Login service: not available on this platform (run the Bridge in a terminal)");
     else if (st.installed && st.pid) ok(`Login service: installed (${st.definition}) and running (pid ${st.pid})`);
     else if (st.installed) warn(`Login service: installed (${st.definition}) but no Bridge is reporting in`, `look at ${st.log}, or \`${cli("restart")}\``);
-    else if (!IS_DESKTOP) warn("Login service: not installed, so the Bridge stops when this window closes", `\`${cli("install")}\` installs it and starts it now`);
+    else if (IS_DESKTOP) ok("Login service: Cookbook Desktop supervises this Bridge (starts at login from the tray)");
+    else warn("Login service: not installed, so the Bridge stops when this window closes", `\`${cli("install")}\` installs it and starts it now`);
   } catch (e) {
     ok(`Login service: could not check (${e.message})`);
   }
