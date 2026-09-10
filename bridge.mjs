@@ -2122,7 +2122,14 @@ async function checkClaudeAuth(cfg) {
   if (loggedIn === null) return null;
   const changed = noteAuth("claude", loggedIn);
   if (changed && !loggedIn) log("! Claude is signed out on this machine → open a terminal, run `claude`, and sign in. This Bridge re-checks every 10 minutes.");
-  if (changed && loggedIn && lastAuthCheck > 0) log("✓ Claude is signed in again — Claude work resumes here.");
+  if (changed && loggedIn && lastAuthCheck > 0) {
+    log("✓ Claude is signed in again — Claude work resumes here.");
+    // Forget the give-ups: the server re-opens the tasks that died on the sign-out
+    // (heartbeat, reopenAuthAbandoned), and this Bridge must be willing to run them.
+    givenUp.clear();
+    attempts.clear();
+    saveRunState();
+  }
   return loggedIn;
 }
 
