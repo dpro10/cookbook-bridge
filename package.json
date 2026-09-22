@@ -1,6 +1,6 @@
 {
   "name": "cookbook-bridge",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "description": "Run your own Claude, Codex and Gemini subscriptions against your Cookbook workspaces. One approval connects every agent CLI on your machine, with a receipt for every run.",
   "type": "module",
   "bin": {
@@ -32,8 +32,11 @@
     "sessions.mjs",
     "synthesis.mjs",
     "thread-runner.mjs",
+    "failures.mjs",
+    "trace.mjs",
     "update.mjs",
     "service.mjs",
+    "cloud-entry.mjs",
     "usage.mjs",
     "volunteer.mjs"
   ],

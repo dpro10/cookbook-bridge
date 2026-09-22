@@ -74,14 +74,14 @@ test("kimiFromLine: tool calls, results, text, session id", () => {
   assert.equal(shortTool(c1.calls[0].name), "read");
   assert.equal(argFor(c1.calls[0].input), "notes/plan.md");
   const t1 = kimiFromLine(SHAPED[1]);
-  assert.deepEqual(t1.calls, [{ kind: "result", id: "call_1", err: false }]);
+  assert.deepEqual(t1.calls, [{ kind: "result", id: "call_1", err: false, content: "# plan\n1. ship" }]);
   const c2 = kimiFromLine(SHAPED[2]);
   assert.equal(c2.calls[0].name, "fetch", "FetchURL reads as the verb live.mjs uses");
   assert.equal(c2.calls[1].name, "mcp__cookbook__complete_task", "MCP names pass through");
   assert.equal(shortTool(c2.calls[1].name), "complete_task");
   assert.equal(argFor(c2.calls[1].input), "t1".length ? argFor({ task_id: "t1", summary: "done" }) : "");
   const t3 = kimiFromLine(SHAPED[4]);
-  assert.deepEqual(t3.calls, [{ kind: "result", id: "call_3", err: true }], "an 'Error:' tool output marks the call failed");
+  assert.deepEqual(t3.calls, [{ kind: "result", id: "call_3", err: true, content: "Error: task not found" }], "an 'Error:' tool output marks the call failed");
   const a = kimiFromLine(SHAPED[5]);
   assert.equal(a.text, "ready"); assert.deepEqual(a.calls, []);
   const s = kimiFromLine(SHAPED[6]);

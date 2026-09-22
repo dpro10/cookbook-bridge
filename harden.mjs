@@ -321,7 +321,7 @@ export function kimiFromLine(line) {
       ev.calls.push({ kind: "call", id: String(tc?.id ?? ""), name, input });
     }
   } else if (j.role === "tool") {
-    ev.calls.push({ kind: "result", id: String(j.tool_call_id ?? ""), err: kimiToolFailed(j.content) });
+    ev.calls.push({ kind: "result", id: String(j.tool_call_id ?? ""), err: kimiToolFailed(j.content), content: j.content });
   } else if (j.role === "meta") {
     if (j.type === "session.resume_hint" && typeof j.session_id === "string" && j.session_id) ev.sessionId = j.session_id;
     if (j.type === "turn.step.retrying") {
@@ -463,4 +463,71 @@ export function kimiMcpState({ home = process.env.HOME || os.homedir(), env = pr
   const want = cookbookUrl ? `${String(cookbookUrl).replace(/\/$/, "")}/api/mcp` : null;
   const hasAuth = !!(srv && typeof srv === "object" && ((srv.headers && srv.headers.Authorization) || srv.bearerTokenEnvVar));
   return { file, exists: json !== null, server: srv, url, matches: !!url && (!want || url === want), hasAuth };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PIN TO COOKBOOK WITHOUT A PER-AGENT TOKEN (the instant-chat lane, 2026-09-14)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// An agent entry with no `token` used to run claude with the member's WHOLE
+// user-scope MCP set: on Diego's Mac that was six servers and 187 tool schemas
+// on every API call (about 60K tokens of context per turn), plus a slower MCP
+// init. The CLI already holds a Cookbook connection (connect wrote it, attributed
+// "Claude · via you"), so the Bridge reuses THAT entry under --strict-mcp-config:
+// same identity, one server, 56 tools. The per-agent token path (withCookbookMcp)
+// still wins when present; `pinMcp: false` in config opts out.
+
+/** The CLI's own Cookbook server entry from ~/.claude.json (user scope), or null.
+ *  Matches on the Cookbook origin when given, else on the /api/mcp path. */
+export function cookbookServerFromClaudeConfig({ cookbookUrl, home = process.env.HOME || os.homedir(), configDir = process.env.CLAUDE_CONFIG_DIR, requireAuth = true } = {}) {
+  const origin = cookbookUrl ? String(cookbookUrl).replace(/\/$/, "") : null;
+  const candidates = [configDir ? path.join(configDir, ".claude.json") : null, path.join(home, ".claude.json")].filter(Boolean);
+  for (const file of candidates) {
+    let j;
+    try { j = JSON.parse(fs.readFileSync(file, "utf8")); } catch { continue; }
+    const servers = j && typeof j === "object" && j.mcpServers && typeof j.mcpServers === "object" ? j.mcpServers : {};
+    for (const [name, entry] of Object.entries(servers)) {
+      if (!entry || typeof entry !== "object") continue;
+      const url = String(entry.url ?? "");
+      if (!url) continue;
+      if (origin ? !url.startsWith(origin + "/") : !/\/api\/mcp\/?$/.test(url)) continue;
+      const headers = entry.headers && typeof entry.headers === "object" ? entry.headers : null;
+      // An OAuth-connected entry keeps its credentials under its server NAME; renamed
+      // to `cookbook` under --strict-mcp-config it would run with no auth at all.
+      // Only a header-authenticated entry (what `connect` writes) is safe to pin.
+      if (requireAuth && !(headers && Object.keys(headers).some((h) => h.toLowerCase() === "authorization"))) continue;
+      return { name, entry: { type: entry.type ?? "http", url, ...(headers ? { headers } : {}) } };
+    }
+  }
+  return null;
+}
+
+/** Rewrite a claude command to load ONLY this Cookbook server (named `cookbook`,
+ *  so `--allowedTools mcp__cookbook__*` keeps matching). Pure. */
+export function withCookbookMcpServer(command, server) {
+  if (!Array.isArray(command) || !isClaudeCommand(command)) return { command, injected: false, reason: "not claude" };
+  if (!server || !server.entry || !server.entry.url) return { command, injected: false, reason: "no server" };
+  if (command.includes("--mcp-config") || command.includes("--strict-mcp-config")) return { command, injected: false, reason: "already pinned" };
+  const cfg = JSON.stringify({ mcpServers: { cookbook: server.entry } });
+  return { command: [command[0], "--strict-mcp-config", "--mcp-config", cfg, ...command.slice(1)], injected: true, reason: null };
+}
+
+/** Remove `cookbook-bridge-*` temp dirs older than `maxAgeMs` (default 6 h): the
+ *  0600 mcp.json files a Bridge that died hard could not clean up. Never touches
+ *  dirs younger than the window (another live Bridge may own them). */
+export function sweepStaleMcpDirs({ dir = os.tmpdir(), maxAgeMs = 6 * 60 * 60_000, now = Date.now() } = {}) {
+  let removed = 0;
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return 0; }
+  for (const name of names) {
+    if (!name.startsWith("cookbook-bridge-")) continue;
+    const full = path.join(dir, name);
+    try {
+      const st = fs.statSync(full);
+      if (!st.isDirectory() || now - st.mtimeMs < maxAgeMs) continue;
+      fs.rmSync(full, { recursive: true, force: true });
+      removed++;
+    } catch { /* best effort */ }
+  }
+  return removed;
 }

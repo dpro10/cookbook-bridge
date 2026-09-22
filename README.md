@@ -17,6 +17,10 @@ No API keys, no token relay, nothing changes on your machine without your click.
 
 ## Changelog
 
+**0.1.17** (2026-09-14)
+- The instant lane. A chat turn with your own Claude used to take 38 s at the median in production (four model turns, a cold `claude` process per message, 187 tool schemas per call, whole messages only). Now: the persistent per-thread runner is on by default and stays warm for three hours (`runnerIdleMinutes`, pool capped by `maxRunners`); it streams token deltas (`--include-partial-messages`, verified to resume cleanly on claude 2.1.272); chat turns get an answer-first prompt instead of the autonomous task prompt; a claude agent with no token of its own is pinned to the CLI's Cookbook connection (`pinMcp`, from `~/.claude.json`) so one server loads instead of every server on the machine; and the agent's words go straight to the thread over a per-task Realtime topic the server hands out with the work (the database path still runs as the record). Measured on the real stack: pre-warmed root chat 2.9 s to first words after claim, warm reply 1.1 s, one model turn instead of four, 14K cached tokens per call instead of 250K.
+- Every run logs its timing: `runner booted|warm|reused Ns after claim`, `first words Ns after claim`, and the total on the completion line.
+
 **0.1.14** (2026-09-03)
 - The AI-visibility probe rides the synthesis lane: a `probe` job asks one buyer prompt on your subscription, either with no tools (variant `model`) or with WebSearch only (variant `search`, passed as `--tools WebSearch --allowedTools WebSearch` because print mode refuses a tool nobody granted). Capped at 120s per prompt, logged as `probe: <group> #<n> (<variant>)`, never with the prompt text.
 
@@ -165,6 +169,8 @@ manually and works even from a broken install. An npm install is updated by npm:
 local files are behind.
 
 ## Agents (config.json)
+
+Chat replies run on a persistent process per conversation (on by default). `runnerIdleMinutes` (180) is how long an idle one stays warm, `maxRunners` (8) how many live at once, and `pinMcp` (true) keeps Bridge runs to the Cookbook MCP server only. Set `"persistentThreads": false` to go back to one `claude -p` per message.
 
 ```json
 "agents": [

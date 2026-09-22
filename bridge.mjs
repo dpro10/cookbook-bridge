@@ -29,6 +29,15 @@
  * Node built-ins only. No dependencies.
  */
 import fs from "node:fs";
+/** This Bridge's own version, filed with every trace; "unknown" on a hand-copied install. */
+const BRIDGE_VERSION = (() => {
+  // npm installs ship package.json next to this file; a service install (the
+  // manifest updater) ships version.json instead; a hand-copied dir has neither.
+  for (const name of ["./package.json", "./version.json"]) {
+    try { const v = JSON.parse(fs.readFileSync(new URL(name, import.meta.url), "utf8")).version; if (v) return String(v); } catch { /* next */ }
+  }
+  return "unknown";
+})();
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,18 +60,21 @@ import { planFromStreamLine, notePlan, planLine, noteAuth, isSignedOutError } fr
 // repair itself — the update path depends ONLY on update.mjs (node built-ins only).
 // The e2e that forced this: a stale install missing volunteer.mjs couldn't even reach
 // the updater when these were static imports.
-import { deriveWakeTopic, wakeSocketSupported, connectWakeSocket } from "./realtime.mjs";
+import { deriveWakeTopic, wakeSocketSupported, connectWakeSocket, createLivePublisher } from "./realtime.mjs";
 import { createSessionReporter } from "./sessions.mjs";
 import { resolveAgentForTask } from "./chef.mjs";
 // The config home + command phrasing live in update.mjs (node built-ins only), so the
 // broken-install `update` path and every other command agree on both.
 import { locateConfig, cli, updateLine, configHome } from "./update.mjs";
-let listWorkspaces, listTasks, listOpenWork, getTask, threadResumeContext, completeTaskApi, resolveDelegation, reportTaskUsage, reportTaskProgress, volunteerClaim, dispatchClaim, abandonTask, recallMemories, recallAcrossWorkspaces, creditRecall, getVolunteerSettings, agentsQuery;
-let agentEnv, checkGeminiVersion, isGeminiCommand, GEMINI_MIN_VERSION, checkAgyVersion, isAgyCommand, AGY_MIN_VERSION, withCookbookMcp, isClaudeCommand, withApprovalRelay, materializeMcpConfig;
+let buildChatPrompt, buildChatFollowUpPrompt;
+let classifyFailure, failurePayload, stagesPayload, failureLine;
+let createTrace, traceEnvelope; // the Record (bridge/trace.mjs); null on an install without it
+let listWorkspaces, listTasks, listOpenWork, getTask, threadResumeContext, completeTaskApi, resolveDelegation, reportTaskUsage, reportTaskProgress, volunteerClaim, dispatchClaim, abandonTask, recallMemories, recallAcrossWorkspaces, creditRecall, getVolunteerSettings, agentsQuery, releaseTask, postTrace;
+let agentEnv, checkGeminiVersion, isGeminiCommand, GEMINI_MIN_VERSION, checkAgyVersion, isAgyCommand, AGY_MIN_VERSION, withCookbookMcp, isClaudeCommand, withApprovalRelay, materializeMcpConfig, cookbookServerFromClaudeConfig, withCookbookMcpServer, sweepStaleMcpDirs;
 let isKimiCommand, kimiFromLine, kimiResultEnvelope, kimiCommand, kimiLoginState, kimiMcpState, checkKimiVersion;
 let extractUsage, displayText;
 let volunteeringEnabled, volunteerCandidates, decisionPrompt, parseDecision, MAX_DECISIONS_PER_POLL, mergeVolunteerSettings, effectiveCapabilities;
-let buildPrompt, buildThreadFollowUpPrompt;
+let buildPrompt, buildThreadFollowUpPrompt, PROMPT_VERSION;
 let runnerFor, hasRunner, warmUp, adoptRunner, reapIdleRunners, killAllRunners;
 let hasCodexThread, reapCodexServer, killCodexServer;
 let checkForUpdate, applyUpdate;
@@ -74,13 +86,18 @@ let fetchHands, claimHandsCall, reportHandsResult;
 async function loadRuntime() {
   ({ createLocalServer, toolsForMode, modeForTools, vendorOf } = await import("./local.mjs"));
   ({ connectAgentsProgrammatic, detectClis } = await import("./device.mjs"));
-  ({ listWorkspaces, listTasks, listOpenWork, getTask, threadResumeContext, completeTaskApi, resolveDelegation, reportTaskUsage, reportTaskProgress, volunteerClaim, dispatchClaim, abandonTask, recallMemories, recallAcrossWorkspaces, creditRecall, getVolunteerSettings, fetchHands, claimHandsCall, reportHandsResult, agentsQuery } = await import("./cookbook.mjs"));
+  ({ listWorkspaces, listTasks, listOpenWork, getTask, threadResumeContext, completeTaskApi, resolveDelegation, reportTaskUsage, reportTaskProgress, volunteerClaim, dispatchClaim, abandonTask, recallMemories, recallAcrossWorkspaces, creditRecall, getVolunteerSettings, fetchHands, claimHandsCall, reportHandsResult, agentsQuery, releaseTask, postTrace } = await import("./cookbook.mjs"));
   ({ serveCalls, describeCall, hostingMode, which: whichExec, argvForSpawn, redact: redactText, resolveCmdShim, killTree, runPreflight, grantsNeedingPreflight } = await import("./hands.mjs"));
   ({ agentEnv, checkGeminiVersion, isGeminiCommand, GEMINI_MIN_VERSION, checkAgyVersion, isAgyCommand, AGY_MIN_VERSION, withCookbookMcp, isClaudeCommand, withApprovalRelay, materializeMcpConfig,
-    isKimiCommand, kimiFromLine, kimiResultEnvelope, kimiCommand, kimiLoginState, kimiMcpState, checkKimiVersion } = await import("./harden.mjs"));
+    isKimiCommand, kimiFromLine, kimiResultEnvelope, kimiCommand, kimiLoginState, kimiMcpState, checkKimiVersion, cookbookServerFromClaudeConfig, withCookbookMcpServer, sweepStaleMcpDirs } = await import("./harden.mjs"));
+  // A Bridge that died hard (kill -9, a force-quit shell) leaves its 0600 mcp.json
+  // temp files behind; every start sweeps the stale ones from earlier processes.
+  try { sweepStaleMcpDirs?.(); } catch { /* best effort */ }
   ({ extractUsage, displayText } = await import("./usage.mjs"));
   ({ volunteeringEnabled, volunteerCandidates, decisionPrompt, parseDecision, MAX_DECISIONS_PER_POLL, mergeVolunteerSettings, effectiveCapabilities } = await import("./volunteer.mjs"));
-  ({ buildPrompt, buildThreadFollowUpPrompt } = await import("./prompt.mjs"));
+  ({ buildPrompt, buildThreadFollowUpPrompt, buildChatPrompt, buildChatFollowUpPrompt, PROMPT_VERSION } = await import("./prompt.mjs"));
+  ({ classifyFailure, failurePayload, stagesPayload, failureLine } = await import("./failures.mjs"));
+  try { ({ createTrace, traceEnvelope } = await import("./trace.mjs")); } catch { /* a hand-copied install without trace.mjs: no traces, everything else runs */ }
   ({ runnerFor, hasRunner, warmUp, adoptRunner, reapIdleRunners, killAllRunners } = await import("./thread-runner.mjs"));
   ({ hasCodexThread, reapCodexServer, killCodexServer } = await import("./codex-runner.mjs"));
   ({ checkForUpdate, applyUpdate } = await import("./update.mjs"));
@@ -183,9 +200,24 @@ function loadConfig() {
     process.exit(1);
   }
   cfg.pollSeconds = cfg.pollSeconds ?? 15;
-  // Persistent per-thread agent processes (terminal-feel replies). Opt-in while it
-  // proves itself; the one-shot spawn path remains the fallback either way.
-  cfg.persistentThreads = cfg.persistentThreads ?? false;
+  // Persistent per-thread agent processes (terminal-feel replies). ON by default
+  // since 2026-09-14: a cold `claude -p` per message was the single largest reason a
+  // chat turn took 38 s in production while the same login answered in 4 s inside
+  // Buzz. The one-shot spawn path remains the fallback either way.
+  const explicitPersistent = cfg.persistentThreads === true;
+  cfg.persistentThreads = cfg.persistentThreads ?? true;
+  // How long an idle runner stays alive (minutes) and how many may live at once.
+  const positive = (v, d) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : d);
+  cfg.runnerIdleMinutes = positive(cfg.runnerIdleMinutes, 180);
+  cfg.maxRunners = positive(cfg.maxRunners, 8);
+  // "The final message IS the result" (bridgeFiles) is the CHAT lane's contract.
+  // Board tasks keep calling complete_task unless a config explicitly asked for the
+  // old persistentThreads:true behavior (Chef's config did), or sets bridgeFilesAll.
+  cfg.bridgeFilesAll = cfg.bridgeFilesAll ?? explicitPersistent;
+  // Pin claude runs to the CLI's own Cookbook connection when the agent has no
+  // token of its own (harden.mjs cookbookServerFromClaudeConfig). `pinMcp: false`
+  // keeps the old behavior (every user-scope MCP server loads into every run).
+  cfg.pinMcp = cfg.pinMcp ?? true;
   // LOCAL WORKSPACE ACCESS (2026-08-21): map a workspace to a folder on THIS machine.
   //   localWorkspaces: { "<workspaceId>": { "cwd": "/abs/path", "allowedTools": "…" } }
   // SELF-ASSIGNED tasks in a mapped workspace run IN that folder with real tools
@@ -269,10 +301,34 @@ export function allowedByPolicy(cfg, agent, task) {
  * own token (Chef) ran as whoever the machine's Claude was logged in as — seen
  * 2026-08-28: Chef saw diego's workspaces and "No such grant". Same rewrite, once.
  */
+let pinnedServerCache = { at: 0, url: null, server: null };
+let pinnedNoteShown = false;
+/** The CLI's own Cookbook server entry (cached 60 s per Cookbook origin) for agents
+ *  without a token. Only header-authenticated entries qualify (an OAuth entry's
+ *  credentials live under its server name and would not survive the rename). */
+function cookbookPinServer(cfg) {
+  if (!cfg || cfg.pinMcp === false || !cfg.cookbookUrl || !cookbookServerFromClaudeConfig) return null;
+  if (pinnedServerCache.url !== cfg.cookbookUrl || Date.now() - pinnedServerCache.at > 60_000) {
+    let server = null;
+    try { server = cookbookServerFromClaudeConfig({ cookbookUrl: cfg.cookbookUrl }); } catch { server = null; }
+    pinnedServerCache = { at: Date.now(), url: cfg.cookbookUrl, server };
+    if (server && !pinnedNoteShown) { pinnedNoteShown = true; log(`  ↳ claude runs pinned to this machine's Cookbook connection (one MCP server, not every server on the machine); set "pinMcp": false to opt out`); }
+  }
+  return pinnedServerCache.server;
+}
+/** One place for "make this claude command carry only Cookbook": the agent's own
+ *  token wins; otherwise the CLI's own Cookbook entry (same identity the member
+ *  connected with). Anything else is returned untouched. */
+function pinCommand(cfg, agent, command) {
+  if (!Array.isArray(command)) return command;
+  if (agent.token) return withCookbookMcp(command, { token: agent.token, cookbookUrl: agent.cookbookUrl ?? cfg?.cookbookUrl }).command;
+  const server = cookbookPinServer(cfg);
+  if (server && withCookbookMcpServer) return withCookbookMcpServer(command, server).command;
+  return command;
+}
 function pinnedAgent(cfg, agent) {
   if (!agent || !Array.isArray(agent.command)) return agent;
-  let command = agent.command;
-  if (agent.token) command = withCookbookMcp(command, { token: agent.token, cookbookUrl: agent.cookbookUrl ?? cfg.cookbookUrl }).command;
+  let command = pinCommand(cfg, agent, agent.command);
   // Relay wiring never depends on a per-agent token (the old guard skipped BOTH).
   if (agent.approvalRelay && withApprovalRelay) command = withApprovalRelay(command, agent.approvalRelay).command;
   return command === agent.command ? agent : { ...agent, command };
@@ -297,11 +353,11 @@ export function streamingCommand(command) {
   const rewritten = [...command];
   rewritten[i + 1] = "stream-json";
   if (!rewritten.includes("--verbose")) rewritten.push("--verbose");
-  // Live words stream PER COMPLETED TURN (assistant events), deliberately NOT
-  // --include-partial-messages: that flag stores partial-generation artifacts in the
-  // session file, and RESUMING such a session trips the API's reasoning-extraction
-  // safeguard (observed live 2026-08-20: resumed thread runs refused with
-  // `[reasoning_extraction]`). Resume is the flagship; per-turn streaming is plenty.
+  // One-shot runs stream PER COMPLETED TURN (assistant events). The persistent
+  // runner (thread-runner.mjs) streams token deltas with --include-partial-messages;
+  // a session recorded that way was verified to resume cleanly on claude 2.1.272
+  // (2026-09-14), so the 2026-08-20 [reasoning_extraction] refusal no longer
+  // gates this flag. The one-shot path simply has no reason to pay for deltas.
   return { command: rewritten, streaming: true };
 }
 
@@ -387,7 +443,7 @@ export function sessionIdFrom(line) {
  *  only; buffered/non-streaming runs emit nothing until the end) and keep a
  *  generous absolute ceiling purely as a cost backstop. Pure for tests. */
 export function shouldKill({ streaming, startedAt, lastActivityAt, now, livenessMs, ceilingMs }) {
-  if (now - startedAt >= ceilingMs) return { kill: true, why: `hit the ${Math.round(ceilingMs / 60000)}min absolute ceiling` };
+  if (now - startedAt >= ceilingMs) return { kill: true, why: `hit the ${ceilingMs >= 120_000 ? `${Math.round(ceilingMs / 60000)}min` : `${Math.round(ceilingMs / 1000)}s`} absolute ceiling` };
   if (streaming && livenessMs > 0 && now - lastActivityAt >= livenessMs) {
     return { kill: true, why: `no output for ${Math.round(livenessMs / 1000)}s (stalled — likely a hung prompt or dead CLI)` };
   }
@@ -444,7 +500,7 @@ function spawnAgent(agent, prompt, timeoutSeconds, env, onProgress, opts = {}) {
     // agent's name — never as whatever the CLI is logged in as, and blind to stale
     // claude.ai connectors that poison headless runs (2026-08-25).
     let baseCommand = withCookbookMcp
-      ? withCookbookMcp(opts.command ?? agent.command, { token: agent.token, cookbookUrl: agent.cookbookUrl }).command
+      ? pinCommand(opts.cfg ?? null, agent, opts.command ?? agent.command)
       : (opts.command ?? agent.command);
     if (agent.approvalRelay && withApprovalRelay) baseCommand = withApprovalRelay(baseCommand, agent.approvalRelay).command;
     const { command, streaming } = onProgress ? streamingCommand(baseCommand) : { command: baseCommand, streaming: false };
@@ -483,7 +539,10 @@ function spawnAgent(agent, prompt, timeoutSeconds, env, onProgress, opts = {}) {
         reject(new Error(`refusing to pass a prompt through the ${path.basename(bare)} shell shim on Windows (cmd.exe quoting is not safe for workspace text). Point this agent's command at the CLI's .js entry or its real executable instead.`));
         return;
       }
-      wrapped = [process.execPath, script, ...args];
+      // Under the compiled launcher process.execPath is the Bridge binary, not node;
+      // the shim's own script wants the node that npm installed it with.
+      const nodeExe = process.versions?.bun ? (whichExec?.("node") ?? process.execPath) : process.execPath;
+      wrapped = [nodeExe, script, ...args];
     } else {
       wrapped = argvForSpawn ? argvForSpawn([bare, ...args]) : [bare, ...args];
     }
@@ -567,11 +626,13 @@ function spawnAgent(agent, prompt, timeoutSeconds, env, onProgress, opts = {}) {
         // text throttle (still ≥300ms apart so a burst of reads is one tick).
         let touched = false;
         for (const ev of callsFromStreamLine(line)) { calls = foldCallEvent(calls, ev); touched = true; }
+        if (opts.trace) { try { opts.trace.onStreamLine(line); } catch { /* evidence is best-effort */ } }
         if (kimi) {
           // Kimi's lines are keyed by `role` (claude's by `type`), so the claude
           // parsers above ignore them and this is the only reader.
           const kev = kimiFromLine(line);
           if (kev) {
+            if (opts.trace) { try { opts.trace.onKimiEvent(kev); } catch { /* evidence is best-effort */ } }
             if (kev.sessionId && !sessionId) sessionId = kev.sessionId;
             if (kev.text) {
               turnsText += (turnsText ? "\n\n" : "") + kev.text;
@@ -663,7 +724,7 @@ async function runAgent(cfg, agent, prompt, onProgress, retry = null, taskCtx = 
       warnedCodexToken = true;
       log(`! Codex has no agent token, so it runs under your Bridge token. Run \`${cli("connect")}\` so its work reads "Codex · via you".`);
     }
-    return runCodexTask(agent, prompt, cfg.taskTimeoutSeconds, codexToken, env, onProgress, { threadKey, log, model });
+    return runCodexTask(agent, prompt, cfg.taskTimeoutSeconds, codexToken, env, onProgress, { threadKey, log, model, trace: taskCtx.trace ?? null });
   }
   if (agent.runner === "openclaw") {
     // The visiting-agent lane: one Gateway-backed turn, resumed by session id so a
@@ -688,8 +749,10 @@ async function runAgent(cfg, agent, prompt, onProgress, retry = null, taskCtx = 
   // the failure back. Other CLIs get the failure fed forward in a fresh prompt.
   const { command, resumed } = resumeCommand(agent.command, retry?.sessionId ?? null);
   return spawnAgent(agent, prompt, cfg.taskTimeoutSeconds, env, live ? onProgress : undefined, {
+    cfg,
     command,
     resumed,
+    trace: taskCtx.trace ?? null,
     livenessSeconds: cfg.livenessTimeoutSeconds,
     onChild: taskCtx.onChild,
   });
@@ -711,9 +774,22 @@ function capHoldLine(who, res) {
   return `${who} hit their ${capStr}-token daily cap on your subscription${spentStr} — held until it resets (or you raise it in Account → Agents).`;
 }
 
-function failureHint(result) {
+function failureHint(result, agent = null) {
   if (!result || typeof result !== "object") return "";
   const { code, err, out } = result;
+  // Codex app-server turns carry their reason in `err` (codex-runner.mjs): judged
+  // first, because the transcript is empty and the generic rules below would
+  // read "ran without completing". Both cases are terminal for this attempt.
+  if (agent && agent.runner === "app-server") {
+    const e = String(err ?? "").toLowerCase();
+    if (/could not be refreshed|log out and sign in|unauthorized|token_expired|invalid refresh token/.test(e))
+      return "Codex on this machine is signed out (its login could not be refreshed) → run `CODEX_HOME=~/.codex-bridge codex login` in a terminal; this Bridge picks it up on its own";
+    if (/requires a newer version of codex|upgrade to the latest/.test(e))
+      return "the Codex CLI this Bridge runs is too old for your account's model → update it (`npm i -g @openai/codex`) or point the Codex agent's command at a current `codex`";
+    if (/failed to connect|network|dns|connection error/.test(e))
+      return `Codex can't reach ChatGPT (${String(err).split("\n")[0].slice(0, 160)}) → check the connection`;
+    if (e) return `Codex said: ${String(err).split("\n")[0].slice(0, 200)}`;
+  }
   // JSON-mode envelopes ALWAYS contain the literal substring "permission_denials",
   // so judging on raw output misdiagnosed every failed claude+json run as "a tool
   // was blocked" (live, 2026-07-03). Parse the envelope and judge the REAL fields:
@@ -845,6 +921,7 @@ let warnedCodexToken = false;
 const BOOT_MS = Date.now();
 const inFlight = new Set();
 const inFlightWs = new Map(); // task id → workspace id, for release on shutdown
+const inFlightThreadKeys = new Map(); // taskId -> thread key (one run per conversation at a time)
 
 /**
  * GRACEFUL STOP (2026-08-29): hand every in-flight task back to the board before
@@ -862,7 +939,7 @@ async function releaseInFlight(cfg, why) {
     Promise.allSettled(ids.map(async (id) => {
       try {
         const { callTool } = await import("./cookbook.mjs");
-        await callTool(cfg, "release_task", { workspace_id: inFlightWs.get(id), task_id: id });
+        await callTool(cfg, "release_task", { workspace_id: inFlightWs.get(id), task_id: id, reason: "Bridge stopped; resumes when a Bridge is up" });
         log(`  ↳ released ${id.slice(0, 8)}`);
       } catch (e) { log(`  ↳ couldn't release ${id.slice(0, 8)}: ${e.message}`); }
     })),
@@ -930,6 +1007,9 @@ let lastContactAt = 0;
  *  stay alive on a revoked token (so the user can fix it from the app's Connect UI). A
  *  headless/terminal Bridge still exits loudly with the fix — never a silent zombie. */
 const IS_DESKTOP = process.env.COOKBOOK_DESKTOP === "1";
+/** CLOUD ONE-SHOT (0102): run what is claimable now, then exit. cloud-entry.mjs sets these. */
+const ONCE = process.env.COOKBOOK_ONCE === "1";
+const ONLY_TASK = (process.env.COOKBOOK_ONLY_TASK || "").trim() || null;
 
 /** Run lifecycle → Bridge Local subscribers (the desktop app's notifications). */
 function emitRun(state, ws, task, agent, localMeta) {
@@ -1090,7 +1170,7 @@ async function considerVolunteering(cfg, ws, task, budget) {
       budget.used++;
       let answered = true;
       try {
-        const r = await spawnAgent(agent, decisionPrompt(task, effectiveCapabilities(agent, merged) ?? agent.capabilities), cfg.decisionTimeoutSeconds ?? 90, agentEnv(cfg).env);
+        const r = await spawnAgent(agent, decisionPrompt(task, effectiveCapabilities(agent, merged) ?? agent.capabilities), cfg.decisionTimeoutSeconds ?? 90, agentEnv(cfg).env, undefined, { cfg });
         decision = parseDecision(displayText(r.out));
       } catch {
         // Conservative THIS poll — but a timeout/hiccup is not the model's answer,
@@ -1149,8 +1229,10 @@ async function considerVolunteering(cfg, ws, task, budget) {
 }
 
 async function processTask(cfg, ws, task, agent) {
+  if (inFlight.has(task.id)) return; // the janitor's stale snapshot vs the pull: one launch only
   inFlight.add(task.id);
   inFlightWs.set(task.id, ws.id);
+  inFlightThreadKeys.set(task.id, task.thread_root_id ?? task.id);
   // PRE-CLAIM (Phase 0, audit #1): a dispatched task must be OURS before we spend
   // quota on it. Without this, a to:'any' task — or the same member's Bridge on a
   // second machine — ran N times and the losers found out at the 409 after paying
@@ -1182,7 +1264,43 @@ async function processTask(cfg, ws, task, agent) {
   attempts.set(task.id, (attempts.get(task.id) ?? 0) + 1);
   saveRunState();
   const n = attempts.get(task.id);
-  log(`→ waking ${agent.name} for "${task.title}" in ${ws.name} (attempt ${n}/${cfg.maxAttempts})`);
+  // THE LIVE LANE (realtime.mjs createLivePublisher): the server handed this run a
+  // per-task topic; the browser is subscribed to it. First publish = the
+  // acknowledgement ("your Claude picked this up"), before any process spawns.
+  if (task.server_claimed === true) log(`  ↳ pre-claimed by the server in the pull (one hop)`);
+  const liveTopic = typeof task.live_topic === "string" && /^blive:[0-9a-f]{64}$/.test(task.live_topic) ? task.live_topic : null;
+  const livePub = liveTopic && livePublisher ? livePublisher : null;
+  const tClaim = Date.now();
+  const sinceClaim = () => `${((Date.now() - tClaim) / 1000).toFixed(1)}s`;
+  // STAGES (honest failures): claimed, booted, first words, done or failed, as
+  // milliseconds after the claim. They ride progress ticks live and the usage
+  // report (or the failure) at the end, so the card can draw where a run was.
+  const stages = { claimed: tClaim };
+  // THE RECORD (bridge/trace.mjs): every tool call with its result, filed with the
+  // run's conditions when it ends, done or abandoned. Evidence, never a dependency.
+  const traceCtx = { trace: null, meta: null, recalled: [], cross: [], resume: null, chat: false, model: null };
+  const fileTrace = (outcome) => {
+    if (!traceCtx.trace || !traceEnvelope || !postTrace) return;
+    try {
+      const body = traceEnvelope({
+        workspaceId: ws.id, taskId: task.id, outcome, agent, cfg, model: traceCtx.model,
+        promptVersion: PROMPT_VERSION ?? "", bridgeVersion: BRIDGE_VERSION,
+        recalled: traceCtx.recalled, crossRecalled: traceCtx.cross, resume: traceCtx.resume, chat: traceCtx.chat, stages,
+        localMeta: traceCtx.meta ? { cwd: traceCtx.meta.local_cwd ?? null, mode: traceCtx.meta.local_mode ?? null } : null,
+        trace: traceCtx.trace.finish(),
+      });
+      postTrace(cfg, body).then((ok) => {
+        if (ok) log(`  ↳ trace filed: ${body.trace.calls.length} call${body.trace.calls.length === 1 ? "" : "s"}${body.trace.truncated.complete ? "" : " (truncated)"}`);
+      }).catch(() => {});
+    } catch { /* the trace is evidence, never a reason a run fails */ }
+  };
+  const stageStamps = () => (stagesPayload ? stagesPayload(stages) : {});
+  const livePublish = (stage, extra = {}) => {
+    if (!livePub) return;
+    try { livePub.publish(liveTopic, { v: 1, task_id: task.id, stage, runner: agent.name, at: new Date().toISOString(), ...extra }); } catch { /* fast lane only */ }
+  };
+  livePublish("claimed");
+  log(`→ waking ${agent.name} for "${task.title}" in ${ws.name} (attempt ${n}/${cfg.maxAttempts})${task.chat ? " · chat" : ""}${livePub ? " · live lane" : ""}`);
   let resume = null; // hoisted: the catch path needs to know if the run RESUMED a session
   // PLAN HOLD: a run that discovered a closed plan window (rate_limit_event) is not
   // a failed attempt. Give the attempt back, shelve the task, and let agentHeld()
@@ -1190,6 +1308,10 @@ async function processTask(cfg, ws, task, agent) {
   const runStartedAt = Date.now();
   const holdDuringRun = () => { const h = planHoldFor(agentVendor(agent)); return !!h && h.at >= runStartedAt; };
   const shelveForHold = (reason, sessionId) => {
+    const h0 = planHoldFor(agentVendor(agent));
+    const when = h0 ? "at " + new Date(h0.until).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZoneName: "short" }) : "soon";
+    const keep = sessionId ?? retryCtx.get(task.id)?.sessionId ?? null;
+    reportTaskProgress(cfg, ws.id, task.id, { stage: `held: ${agent.name}'s plan window resets ${when}`, ...(keep ? { session_ref: keep } : {}), ...stageStamps() }).catch(() => {});
     attempts.set(task.id, Math.max(0, (attempts.get(task.id) ?? 1) - 1));
     retryCtx.set(task.id, { sessionId: sessionId ?? retryCtx.get(task.id)?.sessionId ?? null, reason: reason || "plan limit reached" });
     saveRunState();
@@ -1203,28 +1325,50 @@ async function processTask(cfg, ws, task, agent) {
     // Composer follow-ups (0064) skip recall entirely: a resumed session already
     // carries what rode into the original run, and crediting notes that never rode
     // into THIS prompt would corrupt the outcome-weighted signal.
-    const { memories, conventions } = task.thread_root_id
-      ? { memories: [], conventions: [] }
-      : await recallMemories(cfg, ws.id, task.title);
+    // Both recall calls are independent round trips: run them together (a chat
+    // root paid for them back to back before the runner could even be fed).
+    const recallP = task.thread_root_id ? Promise.resolve({ memories: [], conventions: [] }) : recallMemories(cfg, ws.id, task.title);
+    const crossP = task.thread_root_id ? Promise.resolve([]) : recallAcrossWorkspaces(cfg, task.title, ws.id, 3);
+    const { memories, conventions } = await recallP;
     // Credit both classes on verified completion — conventions earn helpful_count too
     // (the outcome signal that ranks proven rules first).
     const recalledIds = [...memories, ...conventions].map((m) => m && m.id).filter(Boolean);
+    traceCtx.recalled = recalledIds;
     if (memories.length) log(`  ↳ injecting ${memories.length} team-memory note${memories.length === 1 ? "" : "s"}`);
     if (conventions.length) log(`  ↳ + ${conventions.length} team convention${conventions.length === 1 ? "" : "s"} (verbatim)`);
     // Proactive cross-workspace recall: proven knowledge from the member's OTHER projects
     // (a playbook, a gotcha) surfaces here without being pointed at it. Best-effort.
-    const crossWorkspace = task.thread_root_id ? [] : await recallAcrossWorkspaces(cfg, task.title, ws.id, 3);
+    const crossWorkspace = await crossP;
+    traceCtx.cross = crossWorkspace.map((m) => m && m.id).filter(Boolean);
     if (crossWorkspace.length) log(`  ↳ + ${crossWorkspace.length} proven note${crossWorkspace.length === 1 ? "" : "s"} from your other projects`);
     const startedAt = Date.now();
     // Live ticker: stream in-flight token counts to the board so the assigner watches
     // the cost accrue. Fire-and-forget + swallow errors — a progress hiccup must never
     // touch the run. (report_task_progress is a no-op once the task leaves 'claimed'.)
     let lastProgressPost = 0;
+    let lastLivePost = 0;
+    let firstWordsAt = 0;
     let localMeta = null; // { local_cwd, local_mode } once local access is decided below
     const onProgress = (p) => {
-      if (Date.now() - lastProgressPost < 1000) return;
-      lastProgressPost = Date.now();
-      reportTaskProgress(cfg, ws.id, task.id, localMeta ? { ...p, ...localMeta } : p).catch(() => {});
+      const now = Date.now();
+      if (!firstWordsAt && (p.live_text || (Array.isArray(p.live_calls) && p.live_calls.length))) {
+        firstWordsAt = now;
+        stages.first_words = now;
+        log(`  ⏱ first words ${sinceClaim()} after claim`);
+      }
+      // Fast lane: the live tail straight to the thread view, every 200 ms at most.
+      if (livePub && now - lastLivePost >= 200) {
+        lastLivePost = now;
+        livePublish("working", {
+          ...(p.live_text ? { live_text: p.live_text } : {}),
+          ...(Array.isArray(p.live_calls) && p.live_calls.length ? { live_calls: p.live_calls } : {}),
+          output_tokens: p.output_tokens ?? 0,
+        });
+      }
+      // Record lane: the database (receipt, late joiners), every 1.5 s.
+      if (now - lastProgressPost < 1500) return;
+      lastProgressPost = now;
+      reportTaskProgress(cfg, ws.id, task.id, { ...p, ...(localMeta ?? {}), ...stageStamps() }).catch(() => {});
     };
     // Retry attempts CONTINUE, not redo (Phase 1): with a saved claude session the
     // prompt is just the next message in the resumed conversation; without one, the
@@ -1296,15 +1440,21 @@ async function processTask(cfg, ws, task, agent) {
     let warmRunner = runnerEligible ? hasRunner(threadKey) : null;
     // ADOPT a pre-warmed runner (0065) for a NEW conversation: the process booted
     // while the member was still typing, so their first words hit a live agent.
-    if (!warmRunner && runnerEligible && !task.thread_root_id && !local) {
-      // (Local runs never adopt from the warm pool — pooled processes are jailed
-      // to workspace tools and the wrong cwd.)
-      warmRunner = adoptRunner(`warm::${ws.id}::${agent.name}`, threadKey);
-      if (warmRunner) log(`  ↳ adopted a pre-warmed ${agent.name} — first message hits a live process`);
+    if (!warmRunner && runnerEligible && !task.thread_root_id && !task.model) {
+      // Local runs adopt only their LOCAL twin (warmed with the folder's cwd and
+      // tools); jailed spares never serve a local turn, nor vice versa. A task
+      // pinned to a model never adopts: the spare runs the default model and
+      // would only be killed and rebooted a few lines down.
+      warmRunner = adoptRunner(`warm::${ws.id}::${agent.name}${local ? "::local" : ""}`, threadKey);
+      if (warmRunner) log(`  ↳ adopted a pre-warmed ${agent.name}${local ? " (local)" : ""} — first message hits a live process`);
     }
     let thread = null;
     if (task.thread_root_id && !warmRunner) {
-      thread = await threadResumeContext(cfg, ws.id, task.thread_root_id, myProfileId).catch(() => null);
+      // The pull may have carried the thread's resume handle (preclaim.ts); the
+      // listing round trip is only for tasks that arrived without it.
+      thread = task.resume && typeof task.resume === "object"
+        ? { sessionRef: task.resume.session_ref ?? null, root: task.resume.root ?? null }
+        : await threadResumeContext(cfg, ws.id, task.thread_root_id, myProfileId).catch(() => null);
       if (thread?.root?.status === "cancelled") {
         inFlight.delete(task.id);
         givenUp.add(task.id);
@@ -1325,14 +1475,26 @@ async function processTask(cfg, ws, task, agent) {
     // Bridge files it — saves a whole model round-trip (the complete_task tool
     // call) plus the verify fetch, every single turn. Applies to claude runners
     // AND the persistent codex server (its final agent message is the answer).
-    const bridgeFiles = cfg.persistentThreads && agent.runner !== "robot";
+    // CHAT: the final message IS the answer and the Bridge files it. Board tasks
+    // keep the complete_task contract unless the config asked for bridgeFilesAll.
+    const bridgeFiles = agent.runner !== "robot" && (task.chat === true || cfg.bridgeFilesAll === true);
+    // CHAT TURNS (server-flagged: the task carries a transcript row) get the chat
+    // prompt: answer first, tools only when they help. Board tasks keep the
+    // autonomous task prompt with its decomposition and capture contract.
+    const chat = task.chat === true && !!buildChatPrompt;
+    traceCtx.chat = chat;
+    traceCtx.model = task.model || null;
     let basePrompt = task.thread_root_id
-      ? buildThreadFollowUpPrompt(ws, task, { resumed: conversationWarm, root: thread?.root ?? null, bridgeFiles })
-      : buildPrompt(ws, task, { memories, conventions, crossWorkspace, volunteered: task.claimed_via === "volunteered", bridgeFiles });
+      ? (chat
+          ? buildChatFollowUpPrompt(ws, task, { resumed: conversationWarm, root: thread?.root ?? null, bridgeFiles })
+          : buildThreadFollowUpPrompt(ws, task, { resumed: conversationWarm, root: thread?.root ?? null, bridgeFiles }))
+      : (chat
+          ? buildChatPrompt(ws, task, { memories, conventions, crossWorkspace, bridgeFiles, agentName: agent.name })
+          : buildPrompt(ws, task, { memories, conventions, crossWorkspace, volunteered: task.claimed_via === "volunteered", bridgeFiles }));
     if (local) {
       basePrompt += `\n\nLOCAL ACCESS: you are running ON the member's machine in ${local.cwd} — this folder is the workspace's local project. You have real file and shell tools; use them for the actual work (build artifacts, code, sites live HERE). Mirror durable outcomes into the Cookbook workspace (files / remember) so the team side stays true.`;
     }
-    const prompt = retry?.sessionId
+    let prompt = retry?.sessionId
       ? `Your previous attempt on this task was interrupted: ${String(retry.reason ?? "unknown failure").slice(0, 300)}. ` +
         `Continue EXACTLY where you left off — do not redo completed work. If you are close, finish and call complete_task; ` +
         `if the task is impossible from this environment, call abandon_task with the reason.`
@@ -1345,6 +1507,9 @@ async function processTask(cfg, ws, task, agent) {
     else if (canResumeThread) log(`  ↳ resuming the thread's conversation (Composer follow-up)`);
     else if (task.thread_root_id) log(`  ↳ thread follow-up, no resumable session — running with the cold baton`);
     resume = retry ?? (canResumeThread ? { sessionId: threadSession } : null);
+    traceCtx.resume = resume;
+    traceCtx.meta = localMeta;
+    traceCtx.trace = createTrace ? createTrace() : null;
     let result = null;
     // approvalRelay runs (0086) NEVER take the runner: stream-json input mode
     // denies non-allowlisted tools without consulting --permission-prompt-tool.
@@ -1368,11 +1533,14 @@ async function processTask(cfg, ws, task, agent) {
           model: taskModel,
         });
         if (taskModel) log(`  ↳ model: ${taskModel}`);
+        if (!usable) stages.booted = Date.now(); // a warm runner was ready before the claim
+        log(`  ⏱ runner ${usable ? "warm" : r.sends === 0 ? "booted" : "reused"} ${sinceClaim()} after claim`);
         killers.set(task.id, () => r.kill());
         result = await r.send(prompt, {
           onProgress: live ? onProgress : undefined,
           timeoutMs: cfg.taskTimeoutSeconds * 1000,
           livenessMs: (cfg.livenessTimeoutSeconds ?? 0) * 1000,
+          trace: traceCtx.trace,
         });
       } catch (e) {
         // busy / not claude / a runner that died or never launched: all fallback
@@ -1380,18 +1548,31 @@ async function processTask(cfg, ws, task, agent) {
         if (/busy|not a claude-shaped|runner is dead|failed to launch/.test(e.message)) {
           log(`  ↳ runner unavailable (${e.message}) — one-shot fallback`);
           result = null;
+          // A thread turn that assumed a warm process must NOT go cold with the
+          // "resumed" prompt (no history in it). Rebuild it as the cold baton.
+          if (task.thread_root_id && warmRunner && !retry) {
+            const ctx = await threadResumeContext(cfg, ws.id, task.thread_root_id, myProfileId).catch(() => null);
+            const cold = { resumed: false, root: ctx?.root ?? null, bridgeFiles };
+            prompt = chat ? buildChatFollowUpPrompt(ws, task, cold) : buildThreadFollowUpPrompt(ws, task, cold);
+            const sess = ctx?.sessionRef && resumeCommand(agent.command, ctx.sessionRef).resumed ? ctx.sessionRef : null;
+            resume = sess ? { sessionId: sess } : null;
+          }
         } else {
           throw e; // real failure: ride the existing retry/abandon machinery
         }
       }
     }
-    if (!result) result = await runAgent(cfg, agent, prompt, onProgress, resume, { ws, task, onChild: (child) => killers.set(task.id, () => killChild(child, "SIGTERM")) });
+    if (!result) {
+      stages.booted = stages.booted ?? Date.now(); // one-shot and app-server paths start here
+      result = await runAgent(cfg, agent, prompt, onProgress, resume, { ws, task, trace: traceCtx.trace, onChild: (child) => killers.set(task.id, () => killChild(child, "SIGTERM")) });
+    }
     if (result && result.sessionId) retryCtx.set(task.id, { sessionId: result.sessionId, reason: retryCtx.get(task.id)?.reason ?? null });
     let after;
     if (bridgeFiles) {
       // File the final message as the result (agent may still have abandoned or
       // self-completed via tools — any conflict just falls back to reading state).
       const finalText = scrub(displayText(result?.out)).trim().slice(0, 20_000);
+      if (finalText) livePublish("working", { live_text: finalText.length > 1800 ? "…" + finalText.slice(-1800) : finalText });
       // Success shape differs by runner: claude one-shots exit 0; the codex server
       // resolves with a turn status (no exit code) — failed statuses fall through.
       const cleanExit = result?.code === 0 || (result?.code === undefined && !/failed/i.test(String(result?.status ?? "")));
@@ -1415,18 +1596,23 @@ async function processTask(cfg, ws, task, agent) {
     }
     if (after?.status === "done") {
       retryCtx.delete(task.id);
-      log(`✓ ${agent.name} completed "${task.title}"`);
+      // A finished Codex turn proves the login works: clear a signed-out flag.
+      if (agent.runner === "app-server" && noteAuth("codex", true)) log("  ↳ Codex is signed in again");
+      livePublish("done");
+      log(`✓ ${agent.name} completed "${task.title}" · ${sinceClaim()} after claim${firstWordsAt ? ` (first words at ${((firstWordsAt - tClaim) / 1000).toFixed(1)}s)` : ""}`);
       emitRun("done", ws, task, agent, localMeta);
       // Outcome signal: credit the memory notes that rode into this SUCCESSFUL run,
       // so proven notes surface first next time (outcome-weighted recall). Best-effort.
-      if (recalledIds.length) creditRecall(cfg, ws.id, recalledIds).catch(() => {});
+      if (recalledIds.length) creditRecall(cfg, ws.id, recalledIds, task.id).catch(() => {});
+      stages.done = Date.now();
+      fileTrace("done");
       // Quota visibility: tell Cookbook what this run cost (tokens/cost from the CLI's
       // own report when available, wall time always) so the assigner sees the price of
       // the delegation. Fire-and-forget — a usage hiccup must never fail a done task.
       try {
         const usage = extractUsage(result, agent.name, Date.now() - startedAt);
         if (usage) {
-          await reportTaskUsage(cfg, ws.id, task.id, usage);
+          await reportTaskUsage(cfg, ws.id, task.id, { ...usage, ...stageStamps() });
           const tok = (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0);
           log(`  ↳ usage reported${tok ? `: ${tok.toLocaleString()} tokens` : ""}${usage.cost_usd ? ` · ~$${usage.cost_usd.toFixed(2)}` : ""}`);
         }
@@ -1437,15 +1623,28 @@ async function processTask(cfg, ws, task, agent) {
       // The agent CLI exited but the task isn't done — surface WHY (login/MCP/tools),
       // instead of the old silent "ran but isn't marked done". This is the line that
       // turns a multi-hour debug into a one-glance fix.
-      const hint = failureHint(result);
+      // HONEST FAILURES: one structured cause for the log, the card and the receipt.
+      const failure = classifyFailure ? classifyFailure({ result, vendor: agentVendor(agent), agent }) : null;
+      if (failure && failure.kind === "plan_window" && !holdDuringRun()) failure.fix = "Retry when the window resets, or pick another agent for this turn.";
+      const hint = failure ? failureLine(failure) : failureHint(result, agent);
       const why = hint ? ` — ${hint}` : "";
+      stages.failed = Date.now();
       if (/signed out/.test(hint) && isClaudeCommand && isClaudeCommand(agent.command)) {
         if (noteAuth("claude", false)) log("! Claude is signed out on this machine → run `claude` in a terminal and sign in. Until then Claude work here falls back or waits.");
         lastAuthCheck = Date.now() - AUTH_CHECK_MS + 60_000; // re-check in a minute
       }
+      if (/^Codex on this machine is signed out/.test(hint)) {
+        // Ride the heartbeat like Claude does (0100): the room shows "signed out"
+        // and readers stop routing to this Codex until a run succeeds again.
+        if (noteAuth("codex", false)) log("! Codex is signed out on this machine → run `CODEX_HOME=~/.codex-bridge codex login` and sign in. Until then Codex work here waits.");
+      }
+      // A terminal cause (signed out, CLI too old, a blocked tool) will not fix itself
+      // between attempts: hand the task back NOW with the reason instead of burning
+      // the retry. Transient causes (network, a quiet process) get the second try.
+      const terminal = failure ? failure.terminal === true : /signed out|too old for your account/.test(hint);
       if (holdDuringRun()) {
         shelveForHold(hint || "plan limit reached", result?.sessionId ?? null);
-      } else if (n >= cfg.maxAttempts) {
+      } else if (n >= cfg.maxAttempts || terminal) {
         givenUp.add(task.id);
         saveRunState();
         // Final attempt: account the burn (see catch path). extractUsage reads the
@@ -1458,7 +1657,8 @@ async function processTask(cfg, ws, task, agent) {
         // so the ASSIGNER sees "tried, gave up, here's why" on the board — instead
         // of a task that silently rots open (or strands claimed, invisible to all).
         retryCtx.delete(task.id);
-        await abandonTask(cfg, ws.id, task.id, hint || `ran ${n} attempt(s) without completing`);
+        await abandonTask(cfg, ws.id, task.id, hint || `ran ${n} attempt(s) without completing`, failure && failurePayload ? failurePayload(failure, stages) : null);
+        fileTrace("abandoned");
         emitRun("failed", ws, task, agent, localMeta);
         log(`✗ ${agent.name} didn't complete "${task.title}" after ${n} attempts${why} — handed back as abandoned.`);
       } else {
@@ -1470,7 +1670,8 @@ async function processTask(cfg, ws, task, agent) {
         const resumedAndFailed = task.thread_root_id && resume?.sessionId;
         retryCtx.set(task.id, {
           sessionId: resumedAndFailed ? null : result?.sessionId ?? retryCtx.get(task.id)?.sessionId ?? null,
-          reason: hint || "ran but did not complete the task",
+          // The model gets the cause, never the human-facing fix text.
+          reason: (failure ? failure.message : hint) || "ran but did not complete the task",
         });
         saveRunState();
         // EVERY failed run is a CLAIMED task now (Phase 0 pre-claims dispatch too),
@@ -1482,13 +1683,22 @@ async function processTask(cfg, ws, task, agent) {
       }
     }
   } catch (e) {
-    if (holdDuringRun() && !stoppedRuns.has(task.id)) {
+    stages.failed = Date.now();
+    const thrownFailure = classifyFailure ? classifyFailure({ error: e, vendor: agentVendor(agent), agent }) : null;
+    if (stoppedRuns.has(task.id)) {
+      // A human pressed Stop: the task is already cancelled server-side; nothing to
+      // retry, nothing to abandon. Checked first so a kill message that happens to
+      // read like a terminal cause cannot route a Stop into abandon_task.
+      stoppedRuns.delete(task.id);
+      givenUp.add(task.id);
+    } else if (holdDuringRun()) {
       shelveForHold(e.message, e.sessionId ?? null);
-    } else if (n >= cfg.maxAttempts) {
+    } else if (n >= cfg.maxAttempts || (thrownFailure && thrownFailure.terminal === true)) {
       givenUp.add(task.id);
       saveRunState();
       retryCtx.delete(task.id);
-      await abandonTask(cfg, ws.id, task.id, e.message || "failed after final attempt");
+      await abandonTask(cfg, ws.id, task.id, thrownFailure ? failureLine(thrownFailure) : (e.message || "failed after final attempt"), thrownFailure && failurePayload ? failurePayload(thrownFailure, stages) : null);
+      fileTrace("abandoned");
       emitRun("failed", ws, task, agent, null);
       // FINAL attempt failed: report what the failed runs actually burned, so the
       // chain token budget sees it. Only on the LAST attempt — usage is first-
@@ -1508,12 +1718,6 @@ async function processTask(cfg, ws, task, agent) {
     // A volunteered task is CLAIMED — invisible to the open scan — so the throw
     // branch (timeouts are the COMMON failure here) must feed the retry shelf
     // exactly like the ran-but-not-done branch, or the claim strands.
-    else if (stoppedRuns.has(task.id)) {
-      // A human pressed Stop: the task is already cancelled server-side; nothing to
-      // retry, nothing to abandon.
-      stoppedRuns.delete(task.id);
-      givenUp.add(task.id);
-    }
     else {
       // Same thread self-heal as the ran-not-done branch: a failed RESUMED thread
       // attempt retries cold rather than back into the same session.
@@ -1526,7 +1730,9 @@ async function processTask(cfg, ws, task, agent) {
     lastRunError = `${agent.name}: ${String(e.message).slice(0, 300)}`;
     log(`✗ ${agent.name} error on "${task.title}": ${e.message}${slow ? ` — the run hit taskTimeoutSeconds (${slow[1]}s); raise it in config.json if this task is just slow` : ""}`);
   } finally {
+    if (livePub) { try { livePub.leave(liveTopic); } catch { /* fast lane only */ } }
     inFlight.delete(task.id);
+    inFlightThreadKeys.delete(task.id);
     inFlightWs.delete(task.id);
     killers.delete(task.id);
     markHot(ws.id); // the reply usually lands right after a run finishes — stay fast for it
@@ -1731,21 +1937,43 @@ const sse = { connected: false, supported: true, aliveAt: 0 };
 // "ring"; /api/bridge/pull carries everything the stream used to push (work,
 // warm hints, stops, hands) and stamps liveness. SSE remains the fallback lane.
 const door = { active: false, connected: false, lastPullOkAt: 0 };
+// The live lane's publisher (realtime.mjs). Created with the doorbell (same
+// Realtime creds from the manifest); null = the database path alone paints.
+let livePublisher = null;
 
 /** One authenticated pull = one former SSE frame. Returns false only when the
  *  server predates /api/bridge/pull (route missing → use the SSE lane). */
 async function pullOnce(cfg, { boot = false } = {}) {
   const aq = agentsQuery(cfg);
   const bootQ = boot ? `${aq ? "&" : "?"}boot=${BOOT_MS}` : "";
-  const res = await fetch(`${cfg.cookbookUrl}/api/bridge/pull${aq}${bootQ}`, {
+  // ONE HOP TO CLAIM: with free slots, the server claims our next tasks inside the
+  // pull and returns them ready to run (delegation resolved, resume handle
+  // attached). We advertise only what we can claim RIGHT NOW (enabled, not in a
+  // plan hold, and no local acceptFrom allowlist the server cannot evaluate), and
+  // we ask for nothing for a minute after handing anything back, so a mismatch can
+  // never loop faster than the beat. Zero slots = plain open work, as before.
+  for (const [id, until] of releasedRecently) if (until <= Date.now()) releasedRecently.delete(id);
+  const slots = Math.max(0, (cfg.maxConcurrentRuns ?? 1) - inFlight.size);
+  const claimable = (cfg.agents ?? []).filter((a) => a && a.enabled !== false && a.name && !agentHeld(a) && !(a.acceptFrom ?? cfg.acceptFrom));
+  const wantClaim = slots > 0 && claimable.length > 0 && releasedRecently.size === 0;
+  const sep = () => (aq || bootQ ? "&" : "?");
+  const claimQ = wantClaim ? `${sep()}claim=${slots}&claim_agents=${encodeURIComponent(claimable.map((a) => String(a.name)).join(","))}` : "";
+  retryPendingReleases(cfg);
+  const res = await fetch(`${cfg.cookbookUrl}/api/bridge/pull${aq}${bootQ}${claimQ}`, {
     headers: { Authorization: `Bearer ${cfg.token}` },
   });
   if (res.status === 404 || res.status === 405) return false;
   if (!res.ok) throw new Error(`pull ${res.status}`);
   const j = await res.json();
   door.lastPullOkAt = Date.now();
-  if (Array.isArray(j.stops) && j.stops.length) stopRuns(j.stops);
-  await dispatchWork(cfg, j.work ?? [], j.warm_hints ?? []);
+  try {
+    if (Array.isArray(j.stops) && j.stops.length) stopRuns(j.stops);
+    await dispatchWork(cfg, j.work ?? [], j.warm_hints ?? []);
+  } catch (e) {
+    // Whatever the server claimed for this pull and we did not start goes back.
+    for (const t of j.work ?? []) if (isPreclaimed(t) && !inFlight.has(t.id)) giveBack(cfg, t, `dispatch failed: ${e.message}`);
+    throw e;
+  }
   if (j.hands && typeof j.hands === "object") {
     hands.activeGrants = j.hands.grants ?? hands.activeGrants;
     noteAwaiting(j.hands.awaiting ?? []);
@@ -1772,6 +2000,12 @@ async function doorbellLoop(cfg) {
     if (res.ok) rt = (await res.json()).realtime ?? null;
   } catch { /* manifest unreachable — the SSE lane copes */ }
   if (!rt?.url || !rt?.anonKey) return false;
+  // The live publisher must exist BEFORE the boot pull: that pull can pre-claim
+  // and start a run, and a run started without a publisher streams nothing
+  // (seen 2026-09-15: a task resumed after a Bridge restart had no live lane).
+  if (!livePublisher) {
+    try { livePublisher = createLivePublisher({ url: rt.url, anonKey: rt.anonKey, log }); } catch { livePublisher = null; }
+  }
   let first;
   try { first = await pullOnce(cfg, { boot: true }); } catch { return false; }
   if (first === false) return false; // no pull route on this server
@@ -1892,13 +2126,49 @@ let sseStopped = false;
  *  Re-entrancy-guarded: overlapping snapshots are redundant (each is a full picture),
  *  and claim CAS + inFlight make any stragglers harmless anyway. */
 let dispatchBusy = false;
+// A snapshot that lands mid-pass is MERGED and run right after, never dropped: a
+// dropped snapshot could carry tasks the server had just pre-claimed for us.
+let pendingDispatch = null;
+function mergeSnapshot(a, b) {
+  const byId = new Map();
+  for (const t of [...(a?.work ?? []), ...(b?.work ?? [])]) if (t && t.id && !(byId.has(t.id) && isPreclaimed(byId.get(t.id)))) byId.set(t.id, t);
+  return { work: [...byId.values()], warmHints: [...(a?.warmHints ?? []), ...(b?.warmHints ?? [])] };
+}
 async function dispatchWork(cfg, work, warmHints) {
-  if (dispatchBusy) return;
+  if (dispatchBusy) { pendingDispatch = mergeSnapshot(pendingDispatch, { work, warmHints }); return; }
   dispatchBusy = true;
   try {
     await dispatchWorkInner(cfg, work, warmHints);
+    while (pendingDispatch) {
+      const p = pendingDispatch;
+      pendingDispatch = null;
+      await dispatchWorkInner(cfg, p.work, p.warmHints);
+    }
   } finally {
     dispatchBusy = false;
+  }
+}
+
+// ── PRE-CLAIM BOOKKEEPING (one hop to claim) ────────────────────────────────
+// Once a task is claimed nothing lists it again, so "pre-claimed and not started"
+// must always end in a release. These helpers make that an invariant.
+const releasedRecently = new Map(); // task id -> until (ms): no claim requests while non-empty
+const pendingReleases = new Map(); // task id -> workspace id: a release that failed, retried on the next pull
+function isPreclaimed(t) {
+  return !!t && t.server_claimed === true && t.status === "claimed" && (!myProfileId || t.claimed_by_profile === myProfileId);
+}
+function giveBack(cfg, t, why) {
+  if (releasedRecently.has(t.id) && !pendingReleases.has(t.id)) return; // already handed back this minute
+  log(`  ↳ releasing "${t.title}" (${why})`);
+  releasedRecently.set(t.id, Date.now() + 60_000);
+  releaseTask(cfg, t.workspace_id, t.id).then((ok) => {
+    if (ok) pendingReleases.delete(t.id);
+    else pendingReleases.set(t.id, t.workspace_id);
+  }).catch(() => pendingReleases.set(t.id, t.workspace_id));
+}
+function retryPendingReleases(cfg) {
+  for (const [id, wsId] of pendingReleases) {
+    releaseTask(cfg, wsId, id).then((ok) => { if (ok) pendingReleases.delete(id); }).catch(() => {});
   }
 }
 
@@ -1909,13 +2179,24 @@ async function dispatchWorkInner(cfg, work, warmHints) {
     for (const h of warmHints ?? []) {
       const agent = agentFor(cfg, h.agent);
       if (!agent || agent.runner === "app-server" || agent.runner === "robot") continue;
-      warmUp({
-        poolKey: `warm::${h.workspace_id}::${agent.name}`,
-        agent: pinnedAgent(cfg, agent),
-        env: agentEnv(cfg).env,
-        helpers: { fold: foldStreamLine, textFrom: textFromStreamLine, sessionFrom: sessionIdFrom, onPlan: notePlanHold },
-        log,
-      });
+      const helpers = { fold: foldStreamLine, textFrom: textFromStreamLine, sessionFrom: sessionIdFrom, onPlan: notePlanHold };
+      warmUp({ poolKey: `warm::${h.workspace_id}::${agent.name}`, agent: pinnedAgent(cfg, agent), env: agentEnv(cfg).env, helpers, log, cap: cfg.maxRunners });
+      // A locally-mapped workspace's chat runs IN the folder with real tools, which
+      // the jailed spare above can't serve. Warm a local twin too (same shape
+      // processTask builds), so the first message in Diego's dev workspace hits a
+      // live process instead of a cold spawn. Ask mode never uses the runner.
+      const local = cfg.localWorkspaces?.[h.workspace_id];
+      const localMode = local?.cwd ? (local.mode ?? modeForTools?.(local.allowedTools) ?? "run") : null;
+      if (local?.cwd && localMode !== "ask" && localizeCommand) {
+        warmUp({
+          poolKey: `warm::${h.workspace_id}::${agent.name}::local`,
+          agent: pinnedAgent(cfg, { ...agent, command: localizeCommand(agent.command, local.allowedTools), cwd: local.cwd }),
+          env: agentEnv(cfg).env,
+          helpers,
+          log,
+          cap: cfg.maxRunners,
+        });
+      }
     }
   }
   const queue = [];
@@ -1938,30 +2219,56 @@ async function dispatchWorkInner(cfg, work, warmHints) {
     }
   }
   volunteeredRetries.push(...held);
+  // ONE RUN PER CONVERSATION AT A TIME: a follow-up typed while the previous turn
+  // is still running waits for it (the UI promises "runs after the current one
+  // finishes"). Without this, the second task dispatched on the next pull, found
+  // the thread's runner busy, and fell to a cold one-shot with no history.
+  const busyThreads = new Set(inFlightThreadKeys.values());
+  const threadKeyOf = (t) => t.thread_root_id ?? t.id;
   for (const t of work) {
     if ((t.assigned_to || "").toLowerCase() === "goal") continue;
     if (inFlight.has(t.id) || givenUp.has(t.id)) continue;
+    // A task the server pre-claimed FOR US in this pull (preclaim.ts). Anything we
+    // cannot run right now goes back at once (and the sweep below catches every
+    // other way of not starting it), so it never sits claimed and idle.
+    const preclaimed = isPreclaimed(t);
+    if (!preclaimed && t.status !== "open") continue;
+    if (busyThreads.has(threadKeyOf(t))) { if (preclaimed) giveBack(cfg, t, "its conversation already has a run in flight"); continue; }
     if ((attempts.get(t.id) ?? 0) >= cfg.maxAttempts) continue;
     // Round two: no configured agent for "Chef" + a support task addressed to Chef +
     // chef-persona.md shipped next to this file = a Chef synthesized from this
     // Bridge's own Claude (bridge/chef.mjs). Configured agents always win.
     const agent = agentFor(cfg, t.assigned_to) ?? resolveAgentForTask(cfg.agents, t, cfg);
-    if (!agent) continue;
-    if (agentHeld(agent)) continue;
-    if (!allowedByPolicy(cfg, agent, t)) continue;
-    let policy;
-    try { policy = await resolveDelegation(cfg, t.id); } catch { continue; }
-    if (policy.decision !== "run") continue;
+    if (!agent) { if (preclaimed) giveBack(cfg, t, "no agent here runs it"); continue; }
+    if (agentHeld(agent)) { if (preclaimed) giveBack(cfg, t, `${agent.name} is in a plan hold`); continue; }
+    if (!allowedByPolicy(cfg, agent, t)) { if (preclaimed) giveBack(cfg, t, "this Bridge's approval policy"); continue; }
+    // The server resolved the delegation policy inside the pull; only a task it
+    // did not decide (older server, a transient error) costs a round trip.
+    let policy = t.delegation && typeof t.delegation === "object" && t.delegation.decision ? t.delegation : null;
+    if (!policy) { try { policy = await resolveDelegation(cfg, t.id); } catch { continue; } }
+    if (policy.decision !== "run") { if (preclaimed) giveBack(cfg, t, `delegation says ${policy.decision}`); continue; }
     queue.push({ ws: { id: t.workspace_id, name: t.workspace_name ?? "workspace" }, task: t, agent });
   }
   queue.sort((a, b) => new Date(a.task.created_at ?? 0) - new Date(b.task.created_at ?? 0));
+  // Two turns of one conversation in the same snapshot: the older one runs now,
+  // the newer waits for the next pull (it will be re-listed as open).
+  const seenThreads = new Set();
+  const serialized = queue.filter((item) => {
+    const k = threadKeyOf(item.task);
+    if (seenThreads.has(k)) return false;
+    seenThreads.add(k);
+    return true;
+  });
   const slots = Math.max(0, cfg.maxConcurrentRuns - inFlight.size);
-  for (const item of queue.slice(0, slots)) {
+  for (const item of serialized.slice(0, slots)) {
     void processTask(cfg, item.ws, item.task, item.agent).catch((e) => log(`✗ run error on "${item.task.title}": ${e.message}`));
   }
+  // THE INVARIANT: every pre-claimed task in this snapshot either started just
+  // now (processTask marks inFlight synchronously) or goes back to open.
+  for (const t of work) if (isPreclaimed(t) && !inFlight.has(t.id)) giveBack(cfg, t, "not started in this pass");
 }
 
-async function pollOnce(cfg, onlyWorkspaceIds = null) {
+async function pollOnce(cfg, onlyWorkspaceIds = null, onlyTaskId = null) {
   let workspaces = await listWorkspaces(cfg);
   // HOT-SCOPED SWEEP (chat feel): a full sweep across N workspaces costs N HTTP
   // round-trips — 12 workspaces ≈ 15s, which WAS the reply latency users felt.
@@ -2006,6 +2313,7 @@ async function pollOnce(cfg, onlyWorkspaceIds = null) {
       continue;
     }
     for (const t of tasks) {
+      if (onlyTaskId && t.id !== onlyTaskId) continue;
       if (inFlight.has(t.id) || givenUp.has(t.id)) continue;
       if ((attempts.get(t.id) ?? 0) >= cfg.maxAttempts) continue;
 
@@ -2082,6 +2390,34 @@ async function pollOnce(cfg, onlyWorkspaceIds = null) {
       log(`! run crashed unexpectedly for "${item.task.title}": ${e.message}`);
     });
   }
+}
+
+/**
+ * CLOUD ONE-SHOT (0102): a sandbox runs this Bridge for one sweep. Claim what is
+ * claimable (or just ONLY_TASK), wait for the runs to finish, exit. Exit codes:
+ * 0 ran (or nothing to do), 3 the named task was not claimable here, 4 a run
+ * outlived the ceiling and was released back to the board.
+ */
+async function runOnceAndExit(cfg) {
+  const t0 = Date.now();
+  log(`one-shot: ${ONLY_TASK ? `task ${ONLY_TASK.slice(0, 8)}` : "everything claimable"}, then exit`);
+  await pollOnce(cfg, null, ONLY_TASK);
+  if (inFlight.size === 0) {
+    log(ONLY_TASK ? "one-shot: that task was not claimable here (gone, claimed elsewhere, or not addressed to an agent in this box)" : "one-shot: nothing to run");
+    process.exit(ONLY_TASK ? 3 : 0);
+  }
+  const started = inFlight.size;
+  const deadline = t0 + (cfg.taskTimeoutSeconds + 120) * 1000 * Math.max(1, cfg.maxAttempts);
+  while (inFlight.size > 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 500));
+  if (inFlight.size > 0) {
+    await releaseInFlight(cfg, "one-shot deadline").catch(() => {});
+    try { killAllRunners?.(); killCodexServer?.(); } catch { /* exiting */ }
+    log(`one-shot: ${inFlight.size} run(s) outlived the ceiling and were released`);
+    process.exit(4);
+  }
+  try { killAllRunners?.(); killCodexServer?.(); } catch { /* exiting */ }
+  log(`one-shot: ${started} run(s) finished in ${Math.round((Date.now() - t0) / 1000)}s`);
+  process.exit(0);
 }
 
 /** How often a RUNNING bridge re-checks the deploy manifest ("app updated → I update"). */
@@ -2249,12 +2585,13 @@ async function main() {
   log(`Cookbook Bridge started · ${cfg.cookbookUrl}`);
   log(`Managing: ${cfg.agents.map((a) => a.name).join(", ") || "(no agents enabled!)"} · polling every ${cfg.pollSeconds}s`);
   // Is the CLI actually able to run? (0100) The answer rides the first heartbeat.
-  await checkClaudeAuth(cfg).catch(() => null);
+  if (!ONCE) await checkClaudeAuth(cfg).catch(() => null);
   lastAuthCheck = Date.now();
 
   // "When the app updates, so does the Bridge": check the deploy manifest now, then
-  // every 6h while running. Set "autoUpdate": false in config to pin.
-  await selfUpdate(cfg, { reexec: true });
+  // every 6h while running. Set "autoUpdate": false in config to pin. A cloud
+  // one-shot already runs the deploy's own files.
+  if (!ONCE) await selfUpdate(cfg, { reexec: true });
   let lastUpdateCheck = Date.now();
 
   // Loud warning if the default agent (the one that runs "any"-assigned tasks) isn't
@@ -2331,8 +2668,9 @@ async function main() {
   // connect a folder, doctor, restart). Started BEFORE the token check on purpose:
   // the whole point of the connect UI is to FIX a broken/missing connection, so its
   // control plane must be up even when the Cookbook token is bad. Additive — a bind
-  // failure never stops the Bridge from doing its real job.
-  try {
+  // failure never stops the Bridge from doing its real job. A cloud one-shot has
+  // no app to talk to and no port to offer.
+  if (!ONCE) try {
     let version = "dev";
     try {
       const { createHash } = await import("node:crypto");
@@ -2388,7 +2726,7 @@ async function main() {
     // TEAM CONNECTORS (0068): a tool connected once in a workspace reaches every
     // member's CLIs, minus secrets (members export secret_env vars themselves).
     // Opt out with "syncConnectors": false. Startup-only; every write is .bak'd.
-    if (cfg.syncConnectors !== false) {
+    if (!ONCE && cfg.syncConnectors !== false) {
       void (async () => {
         try {
           const { listTeamConnectors } = await import("./cookbook.mjs");
@@ -2411,7 +2749,7 @@ async function main() {
         }
       })();
     }
-    {
+    if (!ONCE) {
       const mode = hostingMode(cfg);
       if (mode === "always") log(`⌂ Hosting is ON: an agent you invite can run granted checks on this machine. You'll see every step; \`${cli("host --off")}\` closes the door.`);
       else if (mode === "grants") log(`⌂ Hosting: grants you approve in Cookbook run here (every change still waits for your click). \`${cli("host --off")}\` refuses all.`);
@@ -2436,6 +2774,11 @@ async function main() {
       }
       process.exit(1);
     }
+  }
+
+  if (ONCE) {
+    await runOnceAndExit(cfg);
+    return;
   }
 
   let lastFullSweepAt = 0;
@@ -2523,7 +2866,7 @@ async function main() {
     // HOT MODE (chat feel): while a conversation is active (a run started or
     // finished in the last 3 minutes), poll every second so a reply dispatches
     // near-instantly; decay back to the configured cadence when the room quiets.
-    if (cfg.persistentThreads) { reapIdleRunners(log); reapCodexServer(log); }
+    if (cfg.persistentThreads) { reapIdleRunners(log, cfg.runnerIdleMinutes * 60_000, cfg.maxRunners); reapCodexServer(log); }
     const hot = Date.now() - lastHotAt < HOT_WINDOW_MS;
     await new Promise((r) => setTimeout(r, fastPath || hot ? 1000 : cfg.pollSeconds * 1000));
   }
@@ -2831,14 +3174,14 @@ async function doctorReport(args) {
         continue;
       }
       if (agent.runner === "robot") {
-        const r = await spawnAgent(agent, "", 15, agentEnv(cfg).env);
+        const r = await spawnAgent(agent, "", 15, agentEnv(cfg).env, undefined, { cfg });
         if (r.code === 0 && String(r.out).trim().endsWith("ok")) ok(`${agent.name}: robot agent responds (probe ok)`);
         else warn(`${agent.name}: robot agent probe inconclusive`, String(r.err || r.out).slice(0, 160));
         continue;
       }
 
       try {
-        const r = await spawnAgent(agent, "Reply with the single word: ok", 30, agentEnv(cfg).env);
+        const r = await spawnAgent(agent, "Reply with the single word: ok", 30, agentEnv(cfg).env, undefined, { cfg });
         const text = `${r.out || ""}\n${r.err || ""}`.toLowerCase();
         if (text.includes("not logged in") || text.includes("/login") || text.includes("please log in")) {
           bad(`${agent.name}: CLI is NOT logged in`, `run \`${cmd} auth login\` (persists; setup-token does not)`);
@@ -2874,7 +3217,13 @@ async function doctorReport(args) {
 // undefined, the guard read false, and EVERY command (connect, doctor, the Bridge
 // itself) exited 0 in silence on Node 18/20/22.x. The argv[1] comparison is the
 // portable fallback. Exported for tests.
-export function isMainModule(meta = import.meta, argv = process.argv) {
+export function isMainModule(meta = import.meta, argv = process.argv, launched = globalThis.__cookbookLauncher) {
+  // Under the compiled launcher (launcher.mjs) the entry module is the launcher and
+  // this file is imported, so meta.main is false here. The launcher sets argv the way
+  // node hands it over ([exec, script, ...args]) and marks itself; trust argv then.
+  if (launched) {
+    try { return !!argv[1] && path.resolve(argv[1]) === fileURLToPath(meta.url); } catch { return false; }
+  }
   if (meta.main === true) return true;
   if (meta.main === false) return false;
   try {

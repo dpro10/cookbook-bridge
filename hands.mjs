@@ -29,6 +29,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import { kimiLoginState } from "./harden.mjs";
+import { cli } from "./update.mjs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -687,7 +688,7 @@ export const RUN_TEMPLATES = Object.freeze({
     const bin = which("claude");
     if (!bin) return { error: "The claude CLI isn't installed on this machine (not on PATH)." };
     const raw = ctx?.cfg?.cookbookUrl;
-    if (!raw) return { error: "This Bridge has no cookbookUrl in its config, so there is nothing to point Claude at. Run `npx cookbook-bridge@latest connect` first." };
+    if (!raw) return { error: `This Bridge has no cookbookUrl in its config, so there is nothing to point Claude at. Run \`${cli("connect")}\` first.` };
     let origin;
     try { origin = new URL(String(raw)).origin; } catch { return { error: `cookbookUrl in this Bridge's config is not a valid URL (${String(raw).slice(0, 80)}).` }; }
     return { argv: [bin, "mcp", "add", "--transport", "http", "--scope", "user", "cookbook", `${origin}/api/mcp`], timeoutMs: 45_000 };

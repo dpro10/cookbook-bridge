@@ -110,11 +110,25 @@ export function locateConfig(args = [], opts = {}) {
 }
 
 /**
+ * Is this process the compiled launcher (bridge/launcher.mjs built with Bun into a
+ * `cookbook-bridge` binary)? Bun stamps process.versions.bun, and the binary is
+ * named cookbook-bridge (cookbook-bridge.exe on Windows; the raw build artifact carries a
+ * -<platform> suffix). Injectable for tests.
+ */
+export function runningAsBinary({ versions = process.versions, execPath = process.execPath } = {}) {
+  if (!versions || !versions.bun) return false;
+  const base = String(execPath || "").split(/[\\/]/).pop() || ""; // both separators: a Windows path checked on CI's Linux
+  return /^cookbook-bridge(-[a-z0-9]+-[a-z0-9]+)?(\.exe)?$/i.test(base);
+}
+
+/**
  * How was this copy installed? Decides how every hint spells a command.
+ *   "binary"  running inside the compiled `cookbook-bridge` launcher (no Node on the machine)
  *   "npm"     an npx cache (`_npx`) or an npm install (`node_modules/cookbook-bridge`)
  *   "tarball" bridge.mjs unpacked from the download (or a source checkout)
  */
-export function installLayout(here = HERE) {
+export function installLayout(here = HERE, { binary = runningAsBinary() } = {}) {
+  if (binary) return "binary";
   const n = String(here).replace(/\\/g, "/") + "/";
   if (n.includes("/_npx/") || n.includes("/node_modules/cookbook-bridge/")) return "npm";
   // The service runtime (~/.cookbook/bridge, service.mjs) is reached through npx too:
@@ -123,19 +137,20 @@ export function installLayout(here = HERE) {
   return "tarball";
 }
 
-/** The ONE way to print a Bridge command: `cli("doctor")` reads `npx cookbook-bridge@latest doctor`
- *  on an npm install and `node bridge/bridge.mjs doctor` from a tarball. Bare `cli()` is the run command. */
-export function cli(cmd = "", { here = HERE } = {}) {
-  const base = installLayout(here) === "npm" ? "npx cookbook-bridge@latest" : "node bridge/bridge.mjs";
+/** The ONE way to print a Bridge command: `cli("doctor")` reads `cookbook-bridge doctor`
+ *  under the launcher, `npx cookbook-bridge@latest doctor` on an npm install and
+ *  `node bridge/bridge.mjs doctor` from a tarball. Bare `cli()` is the run command. */
+export function cli(cmd = "", { here = HERE, layout = installLayout(here) } = {}) {
+  const base = layout === "binary" ? "cookbook-bridge" : layout === "npm" ? "npx cookbook-bridge@latest" : "node bridge/bridge.mjs";
   return cmd ? `${base} ${cmd}` : base;
 }
 
 /** The exact line printed when the local files are behind the deploy. Shared by the
  *  running Bridge's startup check, `doctor` and `connect`, so they never disagree. */
-export function updateLine(version, { here = HERE, desktop = process.env.COOKBOOK_DESKTOP === "1" } = {}) {
+export function updateLine(version, { here = HERE, desktop = process.env.COOKBOOK_DESKTOP === "1", layout = installLayout(here) } = {}) {
   if (desktop) return `A newer Bridge ships with the app (deploy ${version}). The Cookbook app manages this copy; update the app to pick it up.`;
-  if (installLayout(here) === "npm") return `A newer Bridge is available (deploy ${version}). Update it with:  ${cli("", { here })}   (@latest fetches the new copy; your config stays in ~/.cookbook)`;
-  return `A newer Bridge is available (deploy ${version}). Update it with:  ${cli("update", { here })}`;
+  if (layout === "npm") return `A newer Bridge is available (deploy ${version}). Update it with:  ${cli("", { layout })}   (@latest fetches the new copy; your config stays in ~/.cookbook)`;
+  return `A newer Bridge is available (deploy ${version}). Update it with:  ${cli("update", { layout })}`;
 }
 
 /** Files the updater manages — must mirror the server's BRIDGE_RUNTIME_FILES. The list

@@ -147,10 +147,10 @@ export async function reportTaskProgress(cfg, workspaceId, taskId, progress) {
  * Credit the memory notes that rode into a run which then completed — the outcome
  * signal behind outcome-weighted recall. Best-effort: never throws (swallowed here).
  */
-export async function creditRecall(cfg, workspaceId, noteIds) {
+export async function creditRecall(cfg, workspaceId, noteIds, taskId = null) {
   if (!Array.isArray(noteIds) || noteIds.length === 0) return;
   try {
-    await callTool(cfg, "credit_recall", { workspace_id: workspaceId, note_ids: noteIds });
+    await callTool(cfg, "credit_recall", { workspace_id: workspaceId, note_ids: noteIds, ...(taskId ? { task_id: taskId } : {}) });
   } catch {
     /* outcome crediting is best-effort — a miss just means the note isn't lifted yet */
   }
@@ -171,6 +171,20 @@ export async function volunteerClaim(cfg, workspaceId, taskId) {
  * The DB's status='open' CAS makes the first claimer the only runner; the loser
  * gets a clean error and skips. Returns the claimed task, or null if lost.
  */
+/**
+ * Hand a server-claimed task back untouched (release_task): the pull pre-claimed
+ * it for this Bridge, but this Bridge cannot run it right now (no agent for it,
+ * a plan hold, its conversation already has a run in flight). Best-effort.
+ */
+export async function releaseTask(cfg, workspaceId, taskId) {
+  try {
+    await callTool(cfg, "release_task", { workspace_id: workspaceId, task_id: taskId });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function dispatchClaim(cfg, workspaceId, taskId) {
   try {
     const body = await callTool(cfg, "claim_task", { workspace_id: workspaceId, task_id: taskId });
@@ -186,9 +200,9 @@ export async function dispatchClaim(cfg, workspaceId, taskId) {
  * here's why" on the board instead of a task that silently rots. Best-effort —
  * an older server without abandon_task just leaves the legacy behavior.
  */
-export async function abandonTask(cfg, workspaceId, taskId, reason) {
+export async function abandonTask(cfg, workspaceId, taskId, reason, failure = null) {
   try {
-    await callTool(cfg, "abandon_task", { workspace_id: workspaceId, task_id: taskId, reason: String(reason ?? "").slice(0, 500) });
+    await callTool(cfg, "abandon_task", { workspace_id: workspaceId, task_id: taskId, reason: String(reason ?? "").slice(0, 500), ...(failure ? { failure } : {}) });
     return true;
   } catch {
     return false;
@@ -288,6 +302,17 @@ export async function claimHandsCall(cfg, callId) {
 }
 
 /** Post the (already-redacted) outcome. The server redacts again before storing. */
+/** File a run's trace (the Record, J1): every tool call with its result, bounded and
+ *  redacted by bridge/trace.mjs. Bridge channel; best-effort; never blocks a run. */
+export async function postTrace(cfg, body) {
+  const res = await fetch(`${cfg.cookbookUrl}/api/bridge/trace`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return res.ok;
+}
+
 export async function reportHandsResult(cfg, callId, result) {
   const res = await fetch(`${cfg.cookbookUrl}/api/bridge/hands/${encodeURIComponent(callId)}`, {
     method: "POST",

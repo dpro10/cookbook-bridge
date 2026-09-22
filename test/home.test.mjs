@@ -152,6 +152,12 @@ test("doctor's process scan parser: ps lines, self excluded, config paths read, 
   const c = parseBridgeProcesses(cim, { platform: "win32", selfPid: 1, format: "ps" });
   assert.equal(c.length, 1);
   assert.equal(c[0].configPath, "C:\\Users\\me\\.cookbook\\config.json");
+  // The compiled launcher runs bridge.mjs the way node does: counted on both shapes.
+  const launcher = "777 \"C:\\Users\\me\\AppData\\Local\\Cookbook\\bin\\cookbook-bridge.exe\" C:\\Users\\me\\.cookbook\\bridge\\bridge.mjs C:\\Users\\me\\.cookbook\\config.json\n888 /Users/me/.cookbook/bin/cookbook-bridge /Users/me/.cookbook/bridge/bridge.mjs /Users/me/.cookbook/config.json";
+  const l = parseBridgeProcesses(launcher, { platform: "win32", selfPid: 1, format: "ps" });
+  assert.deepEqual(l.map((r) => [r.pid, r.configPath]), [[777, "C:\\Users\\me\\.cookbook\\config.json"], [888, "/Users/me/.cookbook/config.json"]]);
+  const tl2 = '"cookbook-bridge.exe","4444","Console","1","90,000 K"\n';
+  assert.deepEqual(parseBridgeProcesses(tl2, { platform: "win32", selfPid: 1 }), [{ pid: 4444, configPath: null, unknownCommand: true }]);
 });
 
 test("hands: the config home's files are readable as projections, local.json stays denied", () => {

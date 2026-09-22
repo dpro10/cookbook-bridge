@@ -86,7 +86,8 @@ const TOOL = {
 // pure exports without a live stdin listener holding their process open.
 // `import.meta.main` is undefined before Node 22.18 / 24.2; without the argv[1]
 // fallback the relay never started on older Nodes and every ask-mode call was denied.
-const IS_MAIN = import.meta.main === true
+const IS_MAIN = (globalThis.__cookbookLauncher && !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url))
+  || import.meta.main === true
   || (import.meta.main !== false && !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url));
 let buf = "";
 if (IS_MAIN) {

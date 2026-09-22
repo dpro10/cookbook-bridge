@@ -13,7 +13,9 @@
  *    the runner is an accelerator, never a dependency.
  *  - one in-flight send per runner (`busy`); concurrent sends are the caller's cue
  *    to use the one-shot path (claim serialization makes this rare).
- *  - idle runners are reaped (default 10 min) and every runner dies with the Bridge.
+ *  - idle runners are reaped (default 3 hours: a chat that pauses for lunch comes
+ *    back to a live process, the way Buzz keeps its ACP sessions warm) and the pool
+ *    is capped; every runner dies with the Bridge.
  *  - stream-parsing helpers are INJECTED (bridge.mjs dispatches on import, so this
  *    module must not import it back).
  */
@@ -23,7 +25,15 @@ import { planFromStreamLine, notePlan, planLine } from "./plan.mjs";
 import { which, redact, killTree } from "./hands.mjs";
 import { materializeMcpConfig } from "./harden.mjs";
 
-const IDLE_MS = 10 * 60_000;
+export const IDLE_MS = 3 * 60 * 60_000;
+// A pre-warmed spare that never got a message is cheap to rebuild: it does not
+// earn the long idle window a real conversation does.
+export const SPARE_IDLE_MS = 15 * 60_000;
+export const MAX_RUNNERS = 8;
+// Live-text cadence. Deltas arrive per token now (--include-partial-messages), so
+// the emit throttle is the only thing between the model and the screen.
+export const TEXT_EMIT_MS = 250;
+export const EVENT_EMIT_MS = 150;
 const runners = new Map(); // threadRootId -> Runner
 
 /** Build the persistent variant of a one-shot claude command: same binary and
@@ -37,7 +47,11 @@ export function persistentCommand(command, resumeSessionId) {
   // Compare on the basename: an absolute path (/opt/homebrew/bin/claude, the
   // desktop app's resolved binary) is just as claude-shaped as the bare name.
   if (!Array.isArray(command) || !isClaudeBinary(command[0])) return null;
-  const args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"];
+  // --include-partial-messages: token deltas, not whole turns. Verified 2026-09-14 on
+  // claude 2.1.272 that a session recorded with partials RESUMES cleanly (the
+  // 2026-08-20 [reasoning_extraction] refusal no longer reproduces); the one-shot
+  // path keeps whole-turn streaming, and any runner failure still falls back to it.
+  const args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages"];
   if (resumeSessionId) args.push("--resume", resumeSessionId);
   // Carry over safety-relevant flags from the configured command (allowlist etc.),
   // dropping prompt/format flags this protocol replaces.
@@ -115,6 +129,7 @@ class Runner {
       }
       let touched = false;
       for (const ev of callsFromStreamLine(line)) { t.calls = foldCallEvent(t.calls, ev); touched = true; }
+      if (t.trace) { try { t.trace.onStreamLine(line); } catch { /* evidence is best-effort */ } }
       const plan = planFromStreamLine(line);
       if (plan && notePlan(plan)) this.log?.(`  ↳ plan ${planLine(plan.vendor, plan)}`);
       if (plan) { try { this.helpers.onPlan?.(plan); } catch { /* hold bookkeeping is best-effort */ } }
@@ -122,6 +137,9 @@ class Runner {
       t.acc = r.acc;
       if (r.resultLine) {
         clearInterval(t.watchdog);
+        // Final flush: whatever streamed inside the last throttle window goes out
+        // now, so the fast lane shows the complete answer the moment it exists.
+        t.emit(true, true);
         this.turn = null;
         this.busy = false;
         this.lastUsedAt = Date.now();
@@ -133,7 +151,7 @@ class Runner {
   }
 
   /** Send one user message; resolves with a one-shot-shaped result envelope. */
-  send(text, { onProgress, timeoutMs, livenessMs }) {
+  send(text, { onProgress, timeoutMs, livenessMs, trace = null }) {
     if (this.dead) return Promise.reject(new Error("thread runner is dead"));
     if (this.busy) return Promise.reject(new Error("thread runner busy"));
     this.busy = true;
@@ -146,10 +164,12 @@ class Runner {
         acc: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, num_turns: 0 },
         turnsText: "", partialText: "",
         calls: [], // live CALLS (bridge/live.mjs): the work log
+        trace, // the Record (bridge/trace.mjs): every call with its result, or null
         lastEmit: 0, lastActivityAt: startedAt,
         // `event` = a tool call started/finished: jumps the text throttle (≥300ms).
-        emit: (event = false) => {
-          if (!onProgress || Date.now() - t.lastEmit < (event ? 300 : 1200)) return;
+        emit: (event = false, force = false) => {
+          if (!onProgress) return;
+          if (!force && Date.now() - t.lastEmit < (event ? EVENT_EMIT_MS : TEXT_EMIT_MS)) return;
           t.lastEmit = Date.now();
           const full = t.partialText ? `${t.turnsText}${t.turnsText ? "\n\n" : ""}${t.partialText}` : t.turnsText;
           const live_text = redact(full.length > 1800 ? "…" + full.slice(-1800) : full);
@@ -196,7 +216,7 @@ export function hasRunner(threadId) {
 
 /** PRE-WARM (0065): boot an idle runner under a pool key before any task exists.
  *  No-op if one is already there or the pool is full. */
-export function warmUp({ poolKey, agent, env, helpers, log, cap = 4 }) {
+export function warmUp({ poolKey, agent, env, helpers, log, cap = MAX_RUNNERS }) {
   if (hasRunner(poolKey)) return;
   if (runners.size >= cap) return;
   try {
@@ -238,12 +258,26 @@ export function runnerFor({ threadId, agent, env, resumeSessionId, helpers, log,
   return r;
 }
 
-export function reapIdleRunners(log, idleMs = IDLE_MS) {
+export function reapIdleRunners(log, idleMs = IDLE_MS, max = MAX_RUNNERS) {
   const now = Date.now();
   for (const [id, r] of runners) {
-    if (r.dead || (now - r.lastUsedAt > idleMs && !r.busy)) {
-      if (!r.dead) { r.kill(); log(`  ↳ thread runner for ${id.slice(0, 8)} reaped (idle)`); }
+    const limit = r.sends === 0 ? Math.min(idleMs, SPARE_IDLE_MS) : idleMs;
+    if (r.dead || (now - r.lastUsedAt > limit && !r.busy)) {
+      if (!r.dead) { r.kill(); log(`  ↳ thread runner for ${id.slice(0, 8)} reaped (idle${r.sends === 0 ? " spare" : ""})`); }
       runners.delete(id);
+    }
+  }
+  // Pool cap: long-lived runners must not grow without bound. Least recently used
+  // idle runners go first; a busy runner is never touched. Pre-warmed spares (no
+  // conversation yet) are the cheapest to lose, so they go before real threads.
+  if (runners.size > max) {
+    const idle = [...runners.entries()].filter(([, r]) => !r.busy && !r.dead)
+      .sort((a, b) => (a[1].sends === 0) === (b[1].sends === 0) ? a[1].lastUsedAt - b[1].lastUsedAt : (a[1].sends === 0 ? -1 : 1));
+    for (const [id, r] of idle) {
+      if (runners.size <= max) break;
+      r.kill();
+      runners.delete(id);
+      log(`  ↳ thread runner for ${id.slice(0, 8)} reaped (pool cap ${max})`);
     }
   }
 }

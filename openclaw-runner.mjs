@@ -108,7 +108,7 @@ function spawnOnce(argv, env, timeoutMs, onProgress) {
       // one beat per chunk would post hundreds of progress calls for a chatty child.
       if (Date.now() - lastBeat < 2000) return;
       lastBeat = Date.now();
-      try { onProgress?.({ input_tokens: 0, output_tokens: 0 }); } catch { /* best-effort */ }
+      try { onProgress?.({ stage: "working" }); } catch { /* best-effort */ }
     });
     child.stderr.on("data", (d) => { if (err.length < MAX_STDERR_CHARS) err += d; });
     child.on("error", (e) => { clearTimeout(timer); resolve({ code: null, out, err: String(e.message) }); });

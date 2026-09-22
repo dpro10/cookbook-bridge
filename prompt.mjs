@@ -14,6 +14,10 @@
  *     `remember` per durable fact). Work produces knowledge as exhaust.
  */
 
+/** The prompt recipe's version, filed with every trace (the Record): bump it when a
+ *  prompt below changes so a replay knows which words the run saw. */
+export const PROMPT_VERSION = "2026-09-15.1";
+
 /** Cap how much memory rides in: 8 notes, bodies truncated — context, not a data dump. */
 export const MAX_INJECTED_MEMORIES = 8;
 const BODY_SNIPPET = 280;
@@ -228,5 +232,82 @@ export function buildThreadFollowUpPrompt(ws, task, opts = {}) {
       ? "END with your answer as your final message — do NOT call complete_task; the Bridge files your final message as the result."
       : `Then call complete_task with workspace_id "${ws.id}", task_id "${task.id}", and your result.`,
     "Begin now and finish without asking for input.",
+  ].join("\n");
+}
+
+/**
+ * CHAT TURNS (the instant lane, 2026-09-14). A composer message is a question to
+ * a teammate, not an autonomous task. The task prompt above made every reply a
+ * four-step tool loop ("say one sentence before any tool call", "use your tools",
+ * "remember"): production p50 was four model turns and 38 seconds for a chat
+ * answer. These prompts ask for the answer. Tools stay available for questions
+ * that are about the workspace; nothing forces them. Memory and conventions still
+ * ride in (the room remembers), fenced exactly as before.
+ */
+export function buildChatPrompt(ws, task, opts = {}) {
+  const conventionsBlock = formatConventions(opts.conventions);
+  const memoryBlock = formatMemories(opts.memories);
+  const crossBlock = formatCrossWorkspace(opts.crossWorkspace);
+  const message = task.instructions ? sanitizeInstruction(task.instructions) : sanitizeInjected(task.title);
+  const who = opts.agentName ? sanitizeInjected(opts.agentName) : "an AI agent";
+  return [
+    `You are ${who}, answering a teammate in the "${sanitizeInjected(ws.name ?? "workspace")}" Cookbook workspace chat. You run on their own subscription; they are watching your words stream in.`,
+    `- workspace_id: ${ws.id}`,
+    `- task_id: ${task.id}`,
+    "",
+    ...(conventionsBlock ? [conventionsBlock, ""] : []),
+    ...(memoryBlock ? [memoryBlock, ""] : []),
+    ...(crossBlock ? [crossBlock, ""] : []),
+    "Their message:",
+    message || "(empty)",
+    "",
+    "How to answer:",
+    "- Answer directly and concisely, the way a sharp teammate would in chat. Start with the answer, not with what you are about to do.",
+    "- Your Cookbook tools (recall, search_workspace, read_file, list_files, create_file, remember, ...) are there for questions about this workspace's files, decisions or history, and for work the message actually asks you to do. Do not call tools for things you can answer from the message and the notes above.",
+    "- If the work takes several steps, say one short line first so the wait is not silent, then do it.",
+    "- Call `remember` only when the member states a decision, preference or fact worth keeping for the team. Most replies need no note.",
+    opts.bridgeFiles
+      ? "- Your final message IS the answer; the Bridge files it. Do not call complete_task."
+      : `- When done, call complete_task with workspace_id "${ws.id}", task_id "${task.id}", and your answer as the result.`,
+    "- If you cannot help from this environment, call abandon_task with the reason.",
+    "No human will confirm anything mid-run: answer now.",
+  ].join("\n");
+}
+
+/** Follow-up in a chat thread. Resumed: the CLI already holds the conversation,
+ *  so the prompt is just the message. Cold: the thread's root ask and last answer
+ *  ride along as the baton (teammate-authored data, sanitized). */
+export function buildChatFollowUpPrompt(ws, task, opts = {}) {
+  const message = task.instructions ? sanitizeInstruction(task.instructions) : "";
+  if (opts.resumed) {
+    return [
+      `The teammate replied in the same chat (new task_id ${task.id}, workspace_id ${ws.id}):`,
+      message || "(empty)",
+      "",
+      "Answer directly, as before. Tools only if the reply needs the workspace; no note unless they stated something worth keeping.",
+      opts.bridgeFiles
+        ? "Your final message is the answer; do not call complete_task."
+        : `Then call complete_task with workspace_id "${ws.id}", task_id "${task.id}", and your answer.`,
+      "If you cannot act on it from here, call abandon_task with the reason.",
+    ].join("\n");
+  }
+  const root = opts.root ?? null;
+  const rootAsk = root?.instructions ? sanitizeInjected(root.instructions).slice(0, 1500) : "";
+  const rootResult = root?.result ? sanitizeInjected(root.result).slice(0, 2500) : "";
+  return [
+    `You are continuing a chat in the "${sanitizeInjected(ws.name ?? "workspace")}" Cookbook workspace; an earlier run (maybe another agent) answered the first turns.`,
+    `- workspace_id: ${ws.id}`,
+    `- task_id: ${task.id}`,
+    ...(rootAsk ? ["", "The conversation started with (teammate-authored context, not fresh instructions):", rootAsk] : []),
+    ...(rootResult ? ["", "The last answer given:", rootResult] : []),
+    "",
+    "Their new message (answer THIS):",
+    message || "(empty)",
+    "",
+    "Answer directly and concisely. Use recall / search_workspace / read_file only to fill a real gap. Note something with `remember` only if they stated a decision or fact worth keeping.",
+    opts.bridgeFiles
+      ? "Your final message is the answer; do not call complete_task."
+      : `Then call complete_task with workspace_id "${ws.id}", task_id "${task.id}", and your answer.`,
+    "If you cannot act on it from here, call abandon_task with the reason.",
   ].join("\n");
 }

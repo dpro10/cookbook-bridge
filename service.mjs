@@ -69,8 +69,8 @@ export function launchdPlist({ node, script, config, home, logPath, pathEnv = pr
 <plist version="1.0">
 <dict>
   <!-- Cookbook Bridge: runs your agents for your team, on your subscriptions.
-       Installed by \`npx cookbook-bridge@latest connect\`; remove with
-       \`npx cookbook-bridge@latest uninstall\`. It updates itself from cookbook.team. -->
+       Installed by the Bridge's connect command; remove with
+       \`cookbook-bridge uninstall\` (npm: npx cookbook-bridge@latest uninstall). It updates itself from cookbook.team. -->
   <key>Label</key>
   <string>${SERVICE_LABEL}</string>
   <key>ProgramArguments</key>
@@ -138,6 +138,16 @@ WantedBy=default.target
 // ── Windows ───────────────────────────────────────────────────────────────────
 
 /** The Startup folder: anything here runs at logon for this user, no admin needed. */
+/** mkdir -p that treats "already there" as success. Node's recursive mkdir never
+ *  throws EEXIST; Bun on Windows did for the Start Menu Startup folder (a fresh
+ *  Windows machine, 2026-09-18), which turned a working connect into "Could not
+ *  install the service" and a Bridge that died with the window. Injectable for tests. */
+export function ensureDir(dir, { mkdir = fs.mkdirSync, mode } = {}) {
+  try { mkdir(dir, mode !== undefined ? { recursive: true, mode } : { recursive: true }); }
+  catch (e) { if (!e || e.code !== "EEXIST") throw e; }
+  return dir;
+}
+
 export function windowsStartupDir(env = process.env) {
   const appData = env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
   return path.join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup");
@@ -146,23 +156,53 @@ export function windowsLauncherPaths(home = os.homedir(), env = process.env) {
   return {
     cmd: path.join(configHome(home), "bridge-service.cmd"),
     vbs: path.join(configHome(home), "bridge-service.vbs"),
+    gen: path.join(configHome(home), "bridge-service.gen"),
     startup: path.join(windowsStartupDir(env), `${WINDOWS_TASK_NAME}.vbs`),
   };
 }
 
-/** The loop: run the Bridge, wait 15s, run again, until the stop file exists. */
-export function windowsCmdScript({ node, script, config, logPath, stopFile }) {
+/**
+ * The loop: run the Bridge, wait 15s, run again, until the stop file exists OR a newer
+ * install has stamped a different generation into the .gen file. The generation is what
+ * makes a re-run of `connect` safe on Windows: launchd replaces a LaunchAgent in place,
+ * but a Startup .cmd loop already running knew nothing about its successor and kept
+ * restarting the old Bridge next to the new one (two Bridges, one token, 2026-09-18).
+ */
+export function windowsCmdScript({ node, script, config, logPath, stopFile, genFile = "", gen = "" }) {
+  const genCheck = genFile && gen
+    ? `set CUR=
+if exist "${genFile}" set /p CUR=<"${genFile}"
+if not "%CUR%"=="${gen}" exit /b 0
+`
+    : "";
   return `@echo off
-rem Cookbook Bridge service loop. Installed by "npx cookbook-bridge@latest connect";
-rem remove with "npx cookbook-bridge@latest uninstall". The Bridge updates itself.
+rem Cookbook Bridge service loop. Installed by the Bridge's connect command;
+rem remove with "cookbook-bridge uninstall" (npm: npx cookbook-bridge@latest uninstall). The Bridge updates itself.
 set COOKBOOK_SERVICE=1
 :loop
 if exist "${stopFile}" exit /b 0
-"${node}" "${script}" "${config}" >> "${logPath}" 2>&1
+${genCheck}"${node}" "${script}" "${config}" >> "${logPath}" 2>&1
 if exist "${stopFile}" exit /b 0
 timeout /t 15 /nobreak >nul
 goto loop
 `;
+}
+
+/** Stop whatever Bridge this config is running before a new service starts: the loop
+ *  (stop file), the process (taskkill, also a foreground one from a terminal), then a
+ *  short wait so the old loop sees the stop file before the new install removes it. */
+export function stopRunningWindowsBridge({ home = os.homedir(), config = defaultConfigPath(home), log = () => {}, wait = (ms) => { const end = Date.now() + ms; while (Date.now() < end) { /* spin: install is synchronous */ } } } = {}) {
+  const stop = stopFilePath(home);
+  try { fs.writeFileSync(stop, String(Date.now())); } catch { /* no home yet */ }
+  // The pid local.json names, whether or not the liveness probe (signal 0, untested
+  // under Bun on Windows) agrees: taskkill on a pid that is gone just fails quietly.
+  let pid = runningPid(config);
+  if (!pid) { try { pid = Number(JSON.parse(fs.readFileSync(path.join(path.dirname(config), "local.json"), "utf8")).pid) || null; } catch { pid = null; } }
+  if (pid) {
+    const r = run("taskkill", ["/PID", String(pid), "/T", "/F"], { allowFail: true });
+    if (r && r.status === 0) { log(`Stopped the Bridge from the earlier install (pid ${pid}).`); wait(1500); }
+  }
+  return pid;
 }
 
 /** Runs the .cmd with no window. */
@@ -226,7 +266,7 @@ function run(cmd, args, { allowFail = false } = {}) {
  */
 export async function installRuntime({ cookbookUrl, home = os.homedir(), log = () => {} } = {}) {
   const dir = runtimeDir(home);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  ensureDir(dir, { mode: 0o700 });
   const cfg = { cookbookUrl: String(cookbookUrl || "https://cookbook.team").replace(/\/$/, "") };
   const check = await checkForUpdate(cfg, dir);
   if (check.changed.length === 0) {
@@ -249,11 +289,11 @@ export function installService({ platform = process.platform, home = os.homedir(
   const script = path.join(runtimeDir(home), "bridge.mjs");
   if (!fs.existsSync(script)) throw new Error(`runtime missing at ${script}; install it first`);
   const logPath = serviceLogPath(home);
-  fs.mkdirSync(configHome(home), { recursive: true, mode: 0o700 });
+  ensureDir(configHome(home), { mode: 0o700 });
 
   if (kind === "launchd") {
     const plistPath = launchdPlistPath(home);
-    fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+    ensureDir(path.dirname(plistPath));
     fs.writeFileSync(plistPath, launchdPlist({ node, script, config, home, logPath, pathEnv: env.PATH }), { mode: 0o644 });
     const domain = `gui/${typeof process.getuid === "function" ? process.getuid() : 501}`;
     run("launchctl", ["bootout", `${domain}/${SERVICE_LABEL}`], { allowFail: true }); // replace a previous install
@@ -264,7 +304,7 @@ export function installService({ platform = process.platform, home = os.homedir(
   }
   if (kind === "systemd") {
     const unitPath = systemdUnitPath(home);
-    fs.mkdirSync(path.dirname(unitPath), { recursive: true });
+    ensureDir(path.dirname(unitPath));
     fs.writeFileSync(unitPath, systemdUnit({ node, script, config, home, logPath, pathEnv: env.PATH }), { mode: 0o644 });
     run("systemctl", ["--user", "daemon-reload"]);
     run("systemctl", ["--user", "enable", "--now", "cookbook-bridge.service"]);
@@ -274,10 +314,13 @@ export function installService({ platform = process.platform, home = os.homedir(
   }
   // Windows: a hidden launcher in the Startup folder. No admin, no Task Scheduler.
   const p = windowsLauncherPaths(home, env);
+  if (platform === "win32") stopRunningWindowsBridge({ home, config, log });
+  const gen = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  fs.writeFileSync(p.gen, gen);
+  fs.writeFileSync(p.cmd, windowsCmdScript({ node, script, config, logPath, stopFile: stopFilePath(home), genFile: p.gen, gen }));
   try { fs.rmSync(stopFilePath(home), { force: true }); } catch { /* none */ }
-  fs.writeFileSync(p.cmd, windowsCmdScript({ node, script, config, logPath, stopFile: stopFilePath(home) }));
   fs.writeFileSync(p.vbs, windowsVbsScript({ cmdPath: p.cmd }));
-  fs.mkdirSync(path.dirname(p.startup), { recursive: true });
+  ensureDir(path.dirname(p.startup));
   fs.copyFileSync(p.vbs, p.startup);
   // Start it now, detached and windowless, the same way the Startup folder will.
   const child = spawn("wscript.exe", ["//B", p.vbs], { detached: true, stdio: "ignore", windowsHide: true });
@@ -304,7 +347,7 @@ export function uninstallService({ platform = process.platform, home = os.homedi
   } else if (kind === "startup") {
     const p = windowsLauncherPaths(home, env);
     fs.writeFileSync(stopFilePath(home), String(Date.now())); // the loop exits on its next turn
-    for (const f of [p.startup, p.vbs, p.cmd]) if (fs.existsSync(f)) { fs.rmSync(f, { force: true }); removed.push(f); }
+    for (const f of [p.startup, p.vbs, p.cmd, p.gen]) if (fs.existsSync(f)) { fs.rmSync(f, { force: true }); if (f !== p.gen) removed.push(f); }
   }
   const pid = runningPid(config);
   if (pid) {

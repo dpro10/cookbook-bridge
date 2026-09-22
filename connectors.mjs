@@ -84,11 +84,40 @@ export function stripTomlSection(text, name) {
   return String(text ?? "").replace(sectionRe(name), "");
 }
 
-/** Render a connector as TOML section(s). Pure; tested. */
+/** `${VAR}` (Claude's env expansion) → "VAR"; anything else → null. Pure. */
+export function envRefOf(value) {
+  const m = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(String(value ?? "").trim());
+  return m ? m[1] : null;
+}
+/** `Bearer ${VAR}` → "VAR" (Codex's bearer_token_env_var adds the "Bearer " itself). Pure. */
+export function bearerRefOf(value) {
+  const m = /^Bearer\s+\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(String(value ?? "").trim());
+  return m ? m[1] : null;
+}
+
+/**
+ * Render a connector as TOML section(s). Pure; tested.
+ * HTTP auth survives the trip (review 2026-09-10): a header whose value is an env
+ * expansion becomes Codex's `env_http_headers` (the variable name, never the
+ * secret); a literal header becomes `http_headers`. A header we cannot express
+ * throws instead of silently dropping the login.
+ */
 export function renderTomlSection(conn) {
   const lines = [`[mcp_servers.${conn.name}]`];
   if (conn.kind === "http") {
     lines.push(`url = ${tomlString(conn.url)}`);
+    const literal = [], byEnv = [];
+    for (const [k, v] of Object.entries(conn.headers ?? {})) {
+      if (!/^[A-Za-z0-9-]{1,64}$/.test(k)) throw new Error(`header name "${k}" is not a plain token`);
+      if (typeof v !== "string") throw new Error(`header "${k}" has a non-string value; cannot write it for Codex`);
+      const bearer = k.toLowerCase() === "authorization" ? bearerRefOf(v) : null;
+      const ref = envRefOf(v);
+      if (bearer) lines.push(`bearer_token_env_var = ${tomlString(bearer)}`);
+      else if (ref) byEnv.push(`${tomlString(k)} = ${tomlString(ref)}`);
+      else literal.push(`${tomlString(k)} = ${tomlString(v)}`);
+    }
+    if (literal.length) lines.push(`http_headers = { ${literal.join(", ")} }`);
+    if (byEnv.length) lines.push(`env_http_headers = { ${byEnv.join(", ")} }`);
   } else {
     lines.push(`command = ${tomlString(conn.command)}`);
     lines.push(`args = [${(conn.args ?? []).map((a) => tomlString(a)).join(", ")}]`);
@@ -134,8 +163,20 @@ export function readVendor(vendor) {
     };
     const argsLine = body.match(/^args\s*=\s*\[([^\]]*)\]/m);
     const args = argsLine ? [...argsLine[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((x) => unq(x[1])) : [];
+    // Inline header tables read back so survey and drift see the auth, not just the URL.
+    const table = (k) => {
+      const hit = body.match(new RegExp(`^${k}\\s*=\\s*\\{([^}]*)\\}`, "m"));
+      const out = {};
+      if (!hit) return out;
+      for (const kv of hit[1].matchAll(/"((?:[^"\\]|\\.)*)"\s*=\s*"((?:[^"\\]|\\.)*)"/g)) out[unq(kv[1])] = unq(kv[2]);
+      return out;
+    };
+    const headers = { ...table("http_headers") };
+    for (const [h, envName] of Object.entries(table("env_http_headers"))) headers[h] = "${" + envName + "}";
+    const bearerVar = get("bearer_token_env_var");
+    if (bearerVar) headers.Authorization = "Bearer ${" + bearerVar + "}";
     out.set(name, get("url")
-      ? { name, kind: "http", url: get("url"), headers: {} }
+      ? { name, kind: "http", url: get("url"), headers }
       : { name, kind: "stdio", command: get("command"), args, env: {} });
   }
   return out;
@@ -235,7 +276,9 @@ export function sync({ only = null, source = "claude", dryRun = false } = {}) {
  *  vendors that expand ${VAR} (claude). Pure. */
 export function teamConnToLocal(row, vendor) {
   const base = { name: String(row.name), kind: row.kind === "stdio" ? "stdio" : "http", command: row.command ?? null, args: Array.isArray(row.args) ? row.args : [], url: row.url ?? null, headers: {}, env: {} };
-  if (base.kind === "http" && row.auth_env && vendor === "claude") {
+  // Claude expands ${VAR} in header values; Codex reads env_http_headers (the
+  // variable name, resolved from the agent's environment). Gemini has neither.
+  if (base.kind === "http" && row.auth_env && (vendor === "claude" || vendor === "codex")) {
     base.headers = { Authorization: "Bearer ${" + row.auth_env + "}" };
   }
   return base;

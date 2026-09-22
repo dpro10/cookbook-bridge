@@ -181,7 +181,9 @@ export function seedConfigFromExample(example, found, { log = () => {} } = {}) {
   let kept = agents.filter((a) => installed.has(exampleAgentVendor(a)));
   if (kept.length === 0) {
     kept = agents.filter((a) => exampleAgentVendor(a) === "claude").map((a) => ({ ...a, enabled: true }));
-    log("No agent CLI found on this machine yet. Keeping a Claude entry so the Bridge is ready once you install Claude Code (npm i -g @anthropic-ai/claude-code), then run connect again.");
+    log(installed.size
+      ? `Claude Code is not on this machine (found: ${[...installed].join(", ")}). Keeping a Claude entry so the Bridge is ready once you install it; the Connect page's install line with COOKBOOK_AGENT=claude does that.`
+      : "No agent CLI found on this machine yet. Keeping a Claude entry so the Bridge is ready once you install Claude Code (the Connect page's install line with COOKBOOK_AGENT=claude does that), then run connect again.");
   }
   for (const a of kept) {
     // Codex ships in the app bundle at a machine-specific path: use the one we found.
@@ -749,9 +751,9 @@ export function parseBridgeProcesses(text, { platform = process.platform, selfPi
     const line = raw.trim();
     if (!line) continue;
     if (format === "tasklist") {
-      // "node.exe","1234","Console","1","12,345 K"
+      // "node.exe","1234","Console","1","12,345 K"  (or the compiled launcher, cookbook-bridge.exe)
       const m = line.match(/^"([^"]+)","(\d+)"/);
-      if (!m || !/^node(\.exe)?$/i.test(m[1])) continue;
+      if (!m || !/^(node|cookbook-bridge)(\.exe)?$/i.test(m[1])) continue;
       const pid = Number(m[2]);
       if (pid === selfPid) continue;
       out.push({ pid, configPath: null, unknownCommand: true });
@@ -763,10 +765,11 @@ export function parseBridgeProcesses(text, { platform = process.platform, selfPi
     const pid = Number(m[1]);
     const cmd = m[2];
     if (pid === selfPid || !/bridge\.mjs(\s|"|$)/.test(cmd)) continue;
-    // Only a node process RUNNING bridge.mjs counts: a shell or editor whose command
-    // line merely mentions the file (a heredoc, `grep bridge.mjs`) is not a Bridge.
+    // Only a node process (or the compiled launcher, which runs bridge.mjs the same
+    // way) RUNNING bridge.mjs counts: a shell or editor whose command line merely
+    // mentions the file (a heredoc, `grep bridge.mjs`) is not a Bridge.
     const first = (cmd.match(/^"([^"]*)"|^(\S+)/) || []).slice(1).find((x) => x !== undefined) ?? "";
-    if (!/(^|[\\/])node(\.exe)?$/i.test(first)) continue;
+    if (!/(^|[\\/])(node|cookbook-bridge)(\.exe)?$/i.test(first)) continue;
     if (/\bnode\s+--check\b|--test\b/.test(cmd)) continue;
     // Everything after bridge.mjs, kept whole: the desktop's config path has a space
     // in it ("Application Support"), so a whitespace split would lose it.
@@ -787,10 +790,10 @@ export function scanBridgeProcesses({ selfPid = process.pid } = {}) {
     return r.stdout || "";
   };
   if (process.platform === "win32") {
-    const cim = run("powershell", ["-NoProfile", "-Command", "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }"]);
+    const cim = run("powershell", ["-NoProfile", "-Command", "Get-CimInstance Win32_Process -Filter \"Name='node.exe' OR Name='cookbook-bridge.exe'\" | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }"]);
     if (cim !== null) return parseBridgeProcesses(cim, { selfPid, format: "ps" });
-    const tl = run("tasklist", ["/FI", "IMAGENAME eq node.exe", "/FO", "CSV", "/NH"]);
-    return tl === null ? null : parseBridgeProcesses(tl, { selfPid, format: "tasklist" });
+    const tl = [run("tasklist", ["/FI", "IMAGENAME eq node.exe", "/FO", "CSV", "/NH"]), run("tasklist", ["/FI", "IMAGENAME eq cookbook-bridge.exe", "/FO", "CSV", "/NH"])];
+    return tl.every((t) => t === null) ? null : parseBridgeProcesses(tl.filter((t) => t !== null).join("\n"), { selfPid, format: "tasklist" });
   }
   const ps = run("ps", ["-axo", "pid=,command="]) ?? run("ps", ["-eo", "pid=,args="]);
   return ps === null ? null : parseBridgeProcesses(ps, { selfPid, format: "ps" });

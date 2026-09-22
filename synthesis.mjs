@@ -354,7 +354,14 @@ async function runOne(entry) {
  *  Options: `env` (process env for claude), and for tests `run(job, ctx)` in
  *  place of the claude runner and `report(cfg, id, payload)` in place of the
  *  POST. */
+let saidNoClaude = false;
 export async function runSynthesisJobs(cfg, jobs, log, opts = {}) {
+  // Synthesis runs on Claude. A Bridge without one (Codex only, a fresh Windows
+  // machine 2026-09-18) used to log "failed after 0s" for every job; say it once.
+  if (!opts.run && !claudeBinaryFrom(cfg?.agents)) {
+    if (!saidNoClaude) { saidNoClaude = true; log?.("  ↳ synthesis (summaries, captions) skipped on this Bridge: it needs Claude Code; another member's Bridge with Claude picks these up"); }
+    return;
+  }
   for (const j of jobs ?? []) {
     if (!j?.id || typeof j.prompt !== "string" || !j.prompt || seen.has(j.id)) continue;
     seen.add(j.id);

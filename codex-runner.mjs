@@ -79,9 +79,15 @@ class CodexServer {
     this.buf = "";
     this.child = spawn(codexBin, ["app-server"], { env: { ...env, CODEX_HOME: codexHome }, stdio: ["pipe", "pipe", "pipe"] });
     this.child.stdin.on("error", () => {}); // EPIPE after the server died: #die reports it
-    this.child.stderr.on("data", () => {});
+    // Keep the tail of stderr: when the app-server dies (an expired login it cannot
+    // refresh, a config it cannot read) the reason is there and nowhere else.
+    this.errTail = "";
+    this.child.stderr.on("data", (d) => { this.errTail = (this.errTail + String(d)).slice(-2000); });
     this.child.on("error", (e) => this.#die(new Error(`could not launch \`${codexBin} app-server\`: ${e.message}`)));
-    this.child.on("close", () => this.#die(new Error("codex app-server exited")));
+    this.child.on("close", (code) => {
+      const said = this.errTail.split("\n").map((l) => l.replace(/\x1b\[[0-9;]*m/g, "").trim()).filter(Boolean).slice(-3).join(" | ");
+      this.#die(new Error(`codex app-server exited${code != null ? ` (${code})` : ""}${said ? `: ${said.slice(0, 600)}` : ""}`));
+    });
     this.child.stdout.on("data", (d) => this.#onData(String(d)));
     // Handshake once for the process lifetime.
     this.ready = this.request("initialize", {
@@ -180,29 +186,41 @@ class CodexServer {
       const t = this.turn;
       if (!t) continue;
       t.lastActivityAt = Date.now();
+      // The app-server reports WHY a turn is failing as an `error` notification
+      // (expired login, a model the CLI is too old for, a dead network). Keep it:
+      // a failed turn with an empty transcript and no reason cost two attempts
+      // and read "gave up" in the thread (Diego, 2026-09-15).
+      if (meth === "error" && m.params && m.params.error) {
+        const msg = typeof m.params.error === "string" ? m.params.error : String(m.params.error.message ?? "");
+        if (msg) t.err = `${t.err ? `${t.err}\n` : ""}${msg.slice(0, 600)}`;
+      }
       if (meth === "item/agentMessage/delta" && m.params && m.params.delta) {
         t.text += m.params.delta;
         t.emit();
       }
       const callEv = codexCallEvent(meth, m.params);
       if (callEv) { t.calls = foldCallEvent(t.calls, callEv); t.emit(true); }
+      if (t.trace) { try { t.trace.onCodexEvent(meth, m.params); } catch { /* evidence is best-effort */ } }
       if (m.params) {
         const u = m.params.usage ?? m.params.tokenUsage ?? m.params.token_usage ?? (m.params.turn && m.params.turn.usage);
         if (u && typeof u === "object") t.usage = u;
       }
       if (meth === "turn/completed" || meth === "turn/failed") {
-        const status = (m.params && m.params.turn && m.params.turn.status) || meth;
+        const turn = (m.params && m.params.turn) || {};
+        const status = turn.status || meth;
+        const turnErr = turn.error && typeof turn.error === "object" ? String(turn.error.message ?? "") : "";
+        if (turnErr && !(t.err || "").includes(turnErr)) t.err = `${t.err ? `${t.err}\n` : ""}${turnErr.slice(0, 600)}`;
         this.turn = null;
         this.lastUsedAt = Date.now();
         clearInterval(t.watchdog);
-        t.resolve({ status, out: t.text.trim(), usage: t.usage });
+        t.resolve({ status, out: t.text.trim(), usage: t.usage, err: t.err || "" });
       }
     }
   }
 
   /** Run one turn (serialized). threadKey maps to a persistent Codex thread —
    *  reused when known, created otherwise. */
-  runTurn({ threadKey, prompt, timeoutSeconds, onProgress, cwd, model }) {
+  runTurn({ threadKey, prompt, timeoutSeconds, onProgress, cwd, model, trace = null }) {
     const exec = async () => {
       if (this.dead) throw new Error("codex app-server is dead");
       await this.ready;
@@ -229,14 +247,16 @@ class CodexServer {
         const startedAt = Date.now();
         const t = {
           resolve, reject,
-          text: "", usage: null, calls: [],
+          text: "", usage: null, calls: [], err: "", trace,
           lastEmit: 0, lastActivityAt: startedAt,
           // `event` = a tool call started/finished: jumps the text throttle (≥300ms).
           emit: (event = false) => {
             if (!onProgress || Date.now() - t.lastEmit < (event ? 300 : 1200)) return;
             t.lastEmit = Date.now();
             const tail = t.text.length > LIVE_TEXT_CAP ? "…" + t.text.slice(-LIVE_TEXT_CAP) : t.text;
-            try { onProgress({ input_tokens: 0, output_tokens: 0, runner: this.agent.name, ...(tail ? { live_text: redact(tail) } : {}), ...(t.calls.length ? { live_calls: wireCalls(t.calls) } : {}) }); } catch { /* best-effort */ }
+            // No token counts here: the app-server reports usage at the end, and a
+            // zero on the wire read as "free" on the receipt. Absent means unknown.
+            try { onProgress({ runner: this.agent.name, stage: "working", ...(tail ? { live_text: redact(tail) } : {}), ...(t.calls.length ? { live_calls: wireCalls(t.calls) } : {}) }); } catch { /* best-effort */ }
           },
           watchdog: setInterval(() => {
             if (Date.now() - startedAt < timeoutSeconds * 1000) return;
@@ -285,5 +305,6 @@ export function runCodexTask(agent, prompt, timeoutSeconds, token, baseEnv, onPr
     onProgress,
     cwd: agent.cwd,
     model: opts.model ?? null,
+    trace: opts.trace ?? null,
   });
 }

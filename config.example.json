@@ -108,6 +108,10 @@
     }
   ],
   "persistentThreads": true,
+  "_persistentThreads": "One live `claude` process per conversation, fed over stdin, so a reply costs model time only (on by default since 2026-09-14; the one-shot spawn is the fallback). runnerIdleMinutes = how long an idle process stays warm; maxRunners = how many live at once; pinMcp = load only the Cookbook MCP server into Bridge runs (the CLI's own entry when the agent has no token), so a chat turn carries 56 tool schemas instead of every server on the machine.",
+  "runnerIdleMinutes": 180,
+  "maxRunners": 8,
+  "pinMcp": true,
   "localWorkspaces": {
     "<workspace-id>": {
       "cwd": "/absolute/path/to/project",
